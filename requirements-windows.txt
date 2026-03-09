@@ -1,0 +1,13 @@
+huggingface_hub
+numpy
+openai-whisper
+openvino_genai
+pywin32
+pytest
+sounddevice
+torch
+transformers
+parler-tts
+kokoro-onnx
+onnxruntime-openvino
+babelvox

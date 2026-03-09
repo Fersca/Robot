@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import contextlib
 import gc
 import importlib
 import json
 import multiprocessing as mp
-import msvcrt
 import os
+import platform
 import queue
 import re
 import random
+import select
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -20,11 +23,139 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
+IS_WINDOWS = platform.system().lower() == "windows"
+IS_LINUX = platform.system().lower() == "linux"
+PLATFORM_NAME = "windows" if IS_WINDOWS else "linux" if IS_LINUX else platform.system().lower()
+
+try:
+    import msvcrt  # type: ignore
+except Exception:
+    msvcrt = None
+
 try:
     import openvino_genai as ov_genai
 except Exception:
     ov_genai = None
 from huggingface_hub import snapshot_download
+
+
+def detect_runtime_platform() -> str:
+    return PLATFORM_NAME
+
+
+def default_tts_backend_for_platform(platform_name: str) -> str:
+    return "windows" if platform_name == "windows" else "espeakng"
+
+
+def normalize_tts_backend_for_platform(tts_backend: str, platform_name: str) -> str:
+    backend = str(tts_backend or "").strip().lower()
+    if backend == "parler_ov":
+        backend = "openvino"
+    if backend not in TTS_BACKEND_OPTIONS:
+        return default_tts_backend_for_platform(platform_name)
+    if backend == "windows" and platform_name != "windows":
+        return "espeakng"
+    return backend
+
+
+def platform_supports_native_voices(platform_name: str) -> bool:
+    return platform_name == "windows"
+
+
+class KeyboardAdapter:
+    @contextlib.contextmanager
+    def capture(self):
+        yield self
+
+    def clear_buffer(self) -> None:
+        return None
+
+    def read_key_nonblocking(self) -> str | None:
+        return None
+
+
+class WindowsKeyboardAdapter(KeyboardAdapter):
+    def clear_buffer(self) -> None:
+        if msvcrt is None:
+            return
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+
+    def read_key_nonblocking(self) -> str | None:
+        if msvcrt is None or not msvcrt.kbhit():
+            return None
+        return msvcrt.getwch()
+
+
+class PosixKeyboardAdapter(KeyboardAdapter):
+    def __init__(self):
+        self._fd: int | None = None
+        self._old_termios = None
+        self._old_flags: int | None = None
+        self._active = False
+
+    @contextlib.contextmanager
+    def capture(self):
+        if not sys.stdin or not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
+            yield self
+            return
+        import fcntl
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old_termios = termios.tcgetattr(fd)
+        old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        try:
+            tty.setcbreak(fd)
+            fcntl.fcntl(fd, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
+            self._fd = fd
+            self._old_termios = old_termios
+            self._old_flags = old_flags
+            self._active = True
+            yield self
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_termios)
+            except Exception:
+                pass
+            try:
+                fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
+            except Exception:
+                pass
+            self._fd = None
+            self._old_termios = None
+            self._old_flags = None
+            self._active = False
+
+    def clear_buffer(self) -> None:
+        while self.read_key_nonblocking() is not None:
+            pass
+
+    def read_key_nonblocking(self) -> str | None:
+        if not self._active or self._fd is None:
+            return None
+        try:
+            readable, _, _ = select.select([sys.stdin], [], [], 0)
+        except Exception:
+            return None
+        if not readable:
+            return None
+        try:
+            data = os.read(self._fd, 1)
+        except BlockingIOError:
+            return None
+        except Exception:
+            return None
+        if not data:
+            return None
+        return data.decode("utf-8", errors="ignore")
+
+
+def create_keyboard_adapter(platform_name: str) -> KeyboardAdapter:
+    if platform_name == "windows":
+        return WindowsKeyboardAdapter()
+    return PosixKeyboardAdapter()
 
 # =========================
 # Config
@@ -215,7 +346,8 @@ DEFAULT_WHISPER_OV_MODELS_DATA = [
 ]
 
 TTS_BACKEND_OPTIONS = ["windows", "parler", "openvino", "kokoro", "babelvox", "espeakng"]
-DEFAULT_TTS_BACKEND = "windows"
+DEFAULT_TTS_BACKEND = default_tts_backend_for_platform(PLATFORM_NAME)
+KEYBOARD = create_keyboard_adapter(PLATFORM_NAME)
 PARLER_OV_DEVICE_OPTIONS = ["AUTO", "CPU", "GPU", "NPU"]
 PARLER_OV_EXPECTED_SIZE_BYTES = {
     "parler-tts/parler-tts-mini-v1": 2600 * 1024 * 1024,
@@ -1139,11 +1271,34 @@ def find_espeak_executable() -> str | None:
     return None
 
 
+def print_espeak_install_suggestion() -> None:
+    if IS_WINDOWS:
+        print("Install suggestion (Windows): winget install eSpeakNG.eSpeakNG\n")
+    elif IS_LINUX:
+        print("Install suggestion (Linux): install the 'espeak-ng' package with your system package manager.\n")
+    else:
+        print("Install suggestion: install 'espeak-ng' and ensure it is available on PATH.\n")
+
+
+def initialize_native_voice_engine(config: dict):
+    if not platform_supports_native_voices(PLATFORM_NAME):
+        return None, None, "Native Windows voices are unavailable on this platform."
+    try:
+        speaker = __import__("win32com.client", fromlist=["Dispatch"]).Dispatch("SAPI.SpVoice")
+        voices = speaker.GetVoices()
+        if voices.Count == 0:
+            raise RuntimeError("No SAPI voices available")
+        apply_voice_config(speaker, voices, config)
+        return speaker, voices, None
+    except Exception as exc:
+        return None, None, str(exc)
+
+
 def speak_espeak_ng(text: str, config: dict, allow_interrupt: bool = False) -> tuple[bool, float]:
     exe = find_espeak_executable()
     if not exe:
         print_error_red("ERROR: eSpeak NG executable not found (espeak-ng/espeak).")
-        print("Install suggestion (Windows): winget install eSpeakNG.eSpeakNG\n")
+        print_espeak_install_suggestion()
         return False, 0.0
 
     voice = str(config.get("espeak_voice", "es")).strip() or "es"
@@ -1170,14 +1325,15 @@ def speak_espeak_ng(text: str, config: dict, allow_interrupt: bool = False) -> t
         proc.wait()
         return False, calc_latency_s
 
-    while proc.poll() is None:
-        if consume_esc_pressed():
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            return True, calc_latency_s
-        time.sleep(0.02)
+    with KEYBOARD.capture():
+        while proc.poll() is None:
+            if consume_esc_pressed():
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                return True, calc_latency_s
+            time.sleep(0.02)
     return False, calc_latency_s
 
 
@@ -1185,7 +1341,7 @@ def list_espeak_voices() -> None:
     exe = find_espeak_executable()
     if not exe:
         print_error_red("ERROR: eSpeak NG executable not found (espeak-ng/espeak).")
-        print("Install suggestion (Windows): winget install eSpeakNG.eSpeakNG\n")
+        print_espeak_install_suggestion()
         return
     print("\neSpeak voices:\n")
     subprocess.run([exe, "--voices"], check=False)
@@ -1796,7 +1952,7 @@ def configure_runtime() -> None:
 HELP_TEXT = """\
 Commands:
   /help                     Show this help
-  /voices                   List Windows voices and select one
+  /voices                   List native voices and select one (Windows only)
   /config                   Configure voice + Whisper STT settings
   /llm_backend <name>       Set LLM backend: local | external
   /max_tokens <n>           Set max new tokens for chat responses
@@ -2279,11 +2435,10 @@ def load_robot_config() -> dict:
         whisper_ov_device = "AUTO"
     cfg["whisper_openvino_device"] = whisper_ov_device
     cfg["whisper_openvino_model_id"] = str(cfg.get("whisper_openvino_model_id", "")).strip()
-    tts_backend = str(cfg.get("tts_backend", DEFAULT_TTS_BACKEND)).strip().lower()
-    if tts_backend == "parler_ov":
-        tts_backend = "openvino"
-    if tts_backend not in TTS_BACKEND_OPTIONS:
-        tts_backend = DEFAULT_TTS_BACKEND
+    tts_backend = normalize_tts_backend_for_platform(
+        cfg.get("tts_backend", DEFAULT_TTS_BACKEND),
+        PLATFORM_NAME,
+    )
     cfg["tts_backend"] = tts_backend
     openvino_tts_device = str(cfg.get("openvino_tts_device", cfg.get("parler_ov_device", "AUTO"))).strip().upper()
     if openvino_tts_device not in PARLER_OV_DEVICE_OPTIONS:
@@ -2419,10 +2574,11 @@ def speak_text(speaker, text: str, config: dict, allow_interrupt: bool = False) 
             pass
         return False, calc_latency_s
 
-    while not speaker.WaitUntilDone(50):
-        if consume_esc_pressed():
-            speaker.Speak("", purge_flags)
-            return True, calc_latency_s
+    with KEYBOARD.capture():
+        while not speaker.WaitUntilDone(50):
+            if consume_esc_pressed():
+                speaker.Speak("", purge_flags)
+                return True, calc_latency_s
     return False, calc_latency_s
 
 
@@ -2447,7 +2603,10 @@ def ensure_tts_runtime(tts_runtime: dict, config: dict) -> bool:
         tts_runtime["active_key"] = None
         gc.collect()
 
-    backend = str(config.get("tts_backend", DEFAULT_TTS_BACKEND)).strip().lower()
+    backend = normalize_tts_backend_for_platform(
+        config.get("tts_backend", DEFAULT_TTS_BACKEND),
+        PLATFORM_NAME,
+    )
     if backend == "windows":
         if tts_runtime.get("active_key") is not None:
             print("Releasing previous TTS model...")
@@ -2461,7 +2620,7 @@ def ensure_tts_runtime(tts_runtime: dict, config: dict) -> bool:
         exe = find_espeak_executable()
         if not exe:
             print_error_red("ERROR: eSpeak NG executable not found (espeak-ng/espeak).")
-            print("Install suggestion (Windows): winget install eSpeakNG.eSpeakNG\n")
+            print_espeak_install_suggestion()
             return False
         tts_runtime["backend"] = "espeakng"
         tts_runtime["active_key"] = ("espeakng", exe)
@@ -2877,7 +3036,10 @@ def speak_text_backend(
     tts_runtime: dict,
     allow_interrupt: bool = False,
 ) -> tuple[bool, float]:
-    backend = str(config.get("tts_backend", DEFAULT_TTS_BACKEND)).strip().lower()
+    backend = normalize_tts_backend_for_platform(
+        config.get("tts_backend", DEFAULT_TTS_BACKEND),
+        PLATFORM_NAME,
+    )
     if backend == "windows":
         if speaker is None:
             print_error_red("ERROR: Windows TTS backend selected but SAPI voice engine is unavailable.")
@@ -3050,6 +3212,10 @@ def speak_text_backend(
 
 
 def choose_voice_interactive(speaker, voices, config: dict) -> None:
+    if not platform_supports_native_voices(PLATFORM_NAME):
+        print("\n⚠️ Native voice selection is only available on Windows.")
+        print("   On Linux, use '/config' with the 'espeakng' backend and '/espeak_voices'.\n")
+        return
     print("\nAvailable voices:\n")
     list_voices(voices)
     while True:
@@ -3119,21 +3285,23 @@ def ensure_dependency_no_deps(module_name: str, pip_name: str, display_name: str
 
 
 def clear_keyboard_buffer() -> None:
-    while msvcrt.kbhit():
-        msvcrt.getwch()
+    KEYBOARD.clear_buffer()
 
 
 def consume_esc_pressed() -> bool:
     esc = False
-    while msvcrt.kbhit():
-        if msvcrt.getwch() == "\x1b":
+    while True:
+        key = KEYBOARD.read_key_nonblocking()
+        if key is None:
+            break
+        if key == "\x1b":
             esc = True
     return esc
 
 
 def record_until_space(sd_mod, np_mod, sample_rate: int = 16000, channels: int = 1, blocksize: int = 1024):
     frames = []
-    clear_keyboard_buffer()
+    stop_ts = time.perf_counter()
 
     def callback(indata, _frames, _time, status):
         if status:
@@ -3141,18 +3309,21 @@ def record_until_space(sd_mod, np_mod, sample_rate: int = 16000, channels: int =
         frames.append(indata.copy())
 
     print("🎙️ Listening... press SPACE to stop.")
-    with sd_mod.InputStream(
-        samplerate=sample_rate,
-        channels=channels,
-        dtype="float32",
-        blocksize=blocksize,
-        callback=callback,
-    ):
-        while True:
-            if msvcrt.kbhit() and msvcrt.getwch() == " ":
-                stop_ts = time.perf_counter()
-                break
-            time.sleep(0.01)
+    with KEYBOARD.capture():
+        clear_keyboard_buffer()
+        with sd_mod.InputStream(
+            samplerate=sample_rate,
+            channels=channels,
+            dtype="float32",
+            blocksize=blocksize,
+            callback=callback,
+        ):
+            while True:
+                key = KEYBOARD.read_key_nonblocking()
+                if key == " ":
+                    stop_ts = time.perf_counter()
+                    break
+                time.sleep(0.01)
 
     if not frames:
         return np_mod.array([], dtype=np_mod.float32), stop_ts
@@ -3448,17 +3619,17 @@ def wait_for_listen_action() -> str:
       - "exit" when ESC is pressed
     """
     print("Press SPACE to start recording, or ESC to exit listen mode.")
-    while True:
-        if not msvcrt.kbhit():
-            time.sleep(0.01)
-            continue
-
-        ch = msvcrt.getwch()
-
-        if ch == " ":
-            return "start"
-        if ch == "\x1b":
-            return "exit"
+    with KEYBOARD.capture():
+        clear_keyboard_buffer()
+        while True:
+            ch = KEYBOARD.read_key_nonblocking()
+            if ch is None:
+                time.sleep(0.01)
+                continue
+            if ch == " ":
+                return "start"
+            if ch == "\x1b":
+                return "exit"
 
 
 def run_listen_mode(
@@ -4265,7 +4436,7 @@ def configure_voice_and_stt(
         if speaker is not None and voices is not None:
             apply_voice_config(speaker, voices, config)
         elif key in {"rate", "volume"}:
-            print("⚠️ Windows voice engine unavailable. Value saved, but not applied live.")
+            print("⚠️ Native voice engine unavailable. Value saved, but not applied live.")
         print(f"{key} updated to {ivalue}")
 
 
@@ -4317,12 +4488,13 @@ def run_chat_turn(
     tts_calc_latencies_s: list[float] = []
 
     def esc_monitor():
-        while not esc_stop_event.is_set():
-            if msvcrt.kbhit() and msvcrt.getwch() == "\x1b":
-                esc_stop_event.set()
-                tts_audio_stop_event.set()
-                return
-            time.sleep(0.01)
+        with KEYBOARD.capture():
+            while not esc_stop_event.is_set():
+                if KEYBOARD.read_key_nonblocking() == "\x1b":
+                    esc_stop_event.set()
+                    tts_audio_stop_event.set()
+                    return
+                time.sleep(0.01)
 
     def tts_worker():
         if tts_audio_queue is None:
@@ -4675,18 +4847,15 @@ def main() -> None:
         "compat": compat,
     }
 
-    try:
-        speaker = __import__("win32com.client", fromlist=["Dispatch"]).Dispatch("SAPI.SpVoice")
-        voices = speaker.GetVoices()
-        if voices.Count == 0:
-            raise RuntimeError("No SAPI voices available")
-        apply_voice_config(speaker, voices, voice_config)
+    speaker, voices, voice_error = initialize_native_voice_engine(voice_config)
+    if speaker is not None and voices is not None:
         save_robot_config(voice_config)
-    except Exception as exc:
-        print(f"\n⚠️ Voice engine unavailable: {exc}")
-        print("   The chat will continue (Windows TTS features may be unavailable).\n")
-        speaker = None
-        voices = None
+    else:
+        print(f"\n⚠️ Voice engine unavailable: {voice_error}")
+        if IS_WINDOWS:
+            print("   The chat will continue (Windows TTS features may be unavailable).\n")
+        else:
+            print("   The chat will continue. Use eSpeak NG or another non-Windows TTS backend.\n")
 
     try:
         pipe, current, history = activate_llm_from_config(voice_config, compat=compat)

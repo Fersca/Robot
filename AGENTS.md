@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository centers on `robot.py`, a Windows-first interactive assistant that combines:
+This repository centers on `robot.py`, a cross-platform interactive assistant for Windows and Linux that combines:
 
 - Local LLM inference through `openvino_genai.LLMPipeline`
 - External OpenAI-compatible LLMs over HTTP
@@ -17,16 +17,11 @@ The project is not structured as a package. The runtime is a single large CLI sc
 - `robot.py`: main application, interactive shell, model management, STT/TTS runtime, OpenAI-compatible server, stats.
 - `robot_config.json`: persisted runtime configuration for LLM/STT/TTS behavior.
 - `ov_models/models.json`: local catalog of LLM models.
-- `voces.py`: earlier and simpler Windows TTS + Whisper prototype with basic tests.
-- `stt_whisper.py`: standalone mic-to-text Whisper CLI.
-- `speecht5_gpu_debug.py`: OpenVINO SpeechT5 GPU debug helper.
-- `speecht5_gpu_debug_patched.py`: patched debug variant for GPU tensor extraction.
-- `babelvox_npu_minimal.py`: minimal BabelVox NPU smoke test.
-- `babelvox_npu_minimal_2.py` and `babelvox_npu_minimal_3.py`: alternate BabelVox experiments/debug scripts.
+- `tests/`: pytest suite covering cross-platform runtime behavior and packaging sanity.
 
 ## Runtime Model
 
-`robot.py` starts an interactive REPL. It loads config, optionally restores a saved LLM, initializes Windows SAPI if available, then waits for commands or free-form prompts.
+`robot.py` starts an interactive REPL. It loads config, optionally restores a saved LLM, initializes the native voice layer when available, then waits for commands or free-form prompts.
 
 Core flow:
 
@@ -128,18 +123,22 @@ The main command surface includes:
 
 ## Platform Assumptions
 
-This project is strongly Windows-oriented.
+This project now targets both Windows and Linux, but not every helper script is equally portable.
 
-- It uses `msvcrt` for keyboard handling.
-- Default TTS depends on Windows SAPI.
-- Audio interaction assumes an interactive console.
-- Some helper scripts target Intel GPU/NPU OpenVINO environments.
-
-Do not treat this as a cross-platform CLI without refactoring.
+- The main app auto-detects the OS at startup.
+- Native Windows voice selection is Windows-only.
+- Linux uses `espeakng` as the default native fallback TTS backend.
+- Audio interaction still assumes an interactive console.
+- Some helper/debug scripts remain Intel/OpenVINO-focused experiments.
 
 ## Dependencies
 
-There is no dependency lockfile in this directory. Dependencies are partly optional and are loaded on demand. Key packages referenced by the code:
+This repo now provides OS-specific dependency files:
+
+- `requirements-windows.txt`
+- `requirements-linux.txt`
+
+Dependencies are still partly optional at runtime because several backends are lazy-loaded. Key packages referenced by the code:
 
 - `openvino_genai`
 - `huggingface_hub`
@@ -156,6 +155,12 @@ There is no dependency lockfile in this directory. Dependencies are partly optio
 
 `espeakng` additionally requires the `espeak-ng` executable installed on the host.
 
+## Tests
+
+- The test suite lives in `tests/`.
+- Use `pytest` as the single test entrypoint.
+- Do not add new embedded test runners inside application scripts.
+
 ## Development Guidance For Codex
 
 - Start by reading `robot.py`. It contains nearly all real behavior.
@@ -167,11 +172,10 @@ There is no dependency lockfile in this directory. Dependencies are partly optio
   - `ESC` interrupts generation or playback
 - If changing TTS/STT/LLM config keys, update both defaults and normalization in `default_robot_config()` and `load_robot_config()`.
 - If adding model catalogs, follow the existing `load_*`, `save_*`, `parse_*`, `*_status_line`, and `choose_*_interactive` patterns.
-- For documentation, describe the project as an interactive local voice assistant for Intel/OpenVINO-focused Windows environments.
+- For documentation, describe the project as an interactive local voice assistant for Intel/OpenVINO-focused Windows and Linux environments.
 
 ## Safe Assumptions
 
 - `robot.py` is the production entry point.
-- `voces.py` is legacy but still useful as a reference or fallback.
 - The repository is currently more of an application workspace than a polished distributable package.
 - Users are likely experimenting with Intel CPU/GPU/NPU combinations and OpenVINO model compatibility.

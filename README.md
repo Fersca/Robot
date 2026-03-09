@@ -1,6 +1,6 @@
 # Robot
 
-A Windows-oriented desktop conversational assistant that combines local or external LLMs, voice input, voice output, and utilities for working with OpenVINO models on CPU, GPU, and NPU.
+A cross-platform desktop conversational assistant for Windows and Linux that combines local or external LLMs, voice input, voice output, and utilities for working with OpenVINO models on CPU, GPU, and NPU.
 
 The core of the project is [`robot.py`](./robot.py). From an interactive console it can:
 
@@ -39,7 +39,7 @@ It also supports continuous listening: once you enter `/listen`, `SPACE` starts 
 
 ### Text-to-Speech
 
-- Windows SAPI
+- Windows SAPI on Windows
 - Parler-TTS on CPU
 - OpenVINO Text2SpeechPipeline
 - Kokoro ONNX
@@ -80,27 +80,15 @@ Example of a chat session in the interactive console.
 
 ## Requirements
 
-The project currently does not include a `requirements.txt` or formal packaging. Dependency loading is mixed: some packages are required, while others are imported on demand depending on the selected backend.
+The repository now ships OS-specific dependency files:
 
-Dependencies referenced by the code:
-
-- `openvino_genai`
-- `huggingface_hub`
-- `pywin32`
-- `numpy`
-- `sounddevice`
-- `openai-whisper`
-- `torch`
-- `transformers`
-- `parler-tts`
-- `kokoro-onnx`
-- `onnxruntime-openvino`
-- `babelvox`
+- [`requirements-windows.txt`](./requirements-windows.txt)
+- [`requirements-linux.txt`](./requirements-linux.txt)
 
 Also:
 
-- Windows is the primary target environment
 - `espeakng` requires the `espeak-ng` executable
+- Linux also needs the system libraries required by `sounddevice` and PortAudio
 - gated or private Hugging Face models use `~/ov_models/hf_auth.json`
 
 Expected Hugging Face token format:
@@ -111,10 +99,22 @@ Expected Hugging Face token format:
 
 ## Quick Start
 
-Create and activate a compatible Python environment, install the dependencies required for the backend you want to use, and then run:
+Create and activate a compatible Python environment, install the dependencies for your OS, and then run the app.
+
+### Windows
 
 ```powershell
+pip install -r .\requirements-windows.txt
 python .\robot.py
+```
+
+### Linux
+
+Install `espeak-ng` and the PortAudio development/runtime packages with your package manager first, then:
+
+```bash
+pip install -r ./requirements-linux.txt
+python ./robot.py
 ```
 
 For a first session, the recommended flow is:
@@ -171,3 +171,13 @@ The main configuration lives in [`robot_config.json`](./robot_config.json). Amon
 - `max_new_tokens`
 
 Catalogs, metrics, and compatibility data live under `~/ov_models`.
+
+## Tests
+
+The automated test suite lives under [`tests`](./tests) and uses `pytest`.
+
+Run:
+
+```bash
+pytest
+```
