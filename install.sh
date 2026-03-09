@@ -18,7 +18,14 @@ sudo apt install -y \
   python3-pip \
   python3-full \
   portaudio19-dev \
-  espeak-ng
+  espeak-ng \
+  ocl-icd-libopencl1 \
+  clinfo
+
+if apt-cache show intel-opencl-icd >/dev/null 2>&1; then
+  echo "[1/4] Installing Intel OpenCL runtime..."
+  sudo apt install -y intel-opencl-icd
+fi
 
 echo "[2/4] Creating virtual environment..."
 python3 -m venv .venv
@@ -29,6 +36,12 @@ source .venv/bin/activate
 echo "[4/4] Installing Python dependencies..."
 python -m pip install --upgrade pip
 pip install -r requirements-linux.txt
+
+echo ""
+echo "OpenCL check:"
+if command -v clinfo >/dev/null 2>&1; then
+  clinfo >/dev/null 2>&1 && echo "  clinfo: OK" || echo "  clinfo: installed, but no OpenCL platform was detected"
+fi
 
 echo ""
 echo "Installation complete."
