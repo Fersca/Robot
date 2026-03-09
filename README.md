@@ -51,11 +51,32 @@ It also supports continuous listening: once you enter `/listen`, `SPACE` starts 
 - [`robot.py`](./robot.py): main application
 - [`robot_config.json`](./robot_config.json): persisted configuration
 - [`ov_models/models.json`](./ov_models/models.json): LLM model catalog
-- [`voces.py`](./voces.py): older, simpler prototype version
-- [`stt_whisper.py`](./stt_whisper.py): minimal Whisper STT CLI
-- [`speecht5_gpu_debug.py`](./speecht5_gpu_debug.py): SpeechT5/OpenVINO GPU debug script
-- [`speecht5_gpu_debug_patched.py`](./speecht5_gpu_debug_patched.py): patched variant of that debug script
-- [`babelvox_npu_minimal.py`](./babelvox_npu_minimal.py): minimal BabelVox NPU test
+
+## Screenshots
+
+### Phi-4 Loaded On The NPU
+
+Example of the application after loading the Phi-4 model on the Intel NPU.
+
+![Phi-4 loaded on NPU](./screenshots/phi_4_npu.png)
+
+### NPU Usage
+
+Example showing NPU usage while the assistant is running a model.
+
+![NPU usage](./screenshots/npu_usage.png)
+
+### Model List
+
+The model selection list used to choose which LLM to load.
+
+![Model list](./screenshots/model_list.png)
+
+### Chat Example
+
+Example of a chat session in the interactive console.
+
+![Chat example](./screenshots/chat_example.png)
 
 ## Requirements
 
@@ -150,15 +171,3 @@ The main configuration lives in [`robot_config.json`](./robot_config.json). Amon
 - `max_new_tokens`
 
 Catalogs, metrics, and compatibility data live under `~/ov_models`.
-
-## Project Status
-
-This repository currently looks more like an advanced experimentation workspace than a fully packaged product. Most of the core logic is concentrated in one large file, and several helper scripts coexist for testing STT, BabelVox, and SpeechT5/OpenVINO behavior.
-
-If the goal is to publish it in a more solid shape on GitHub, the next natural steps would be:
-
-- add a `requirements.txt` or `pyproject.toml`
-- split `robot.py` into modules
-- document installation per backend
-- explicitly version the `ov_models` content
-- add tests for `robot.py`, not only for the `voces.py` prototype
