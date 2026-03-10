@@ -1,9 +1,11 @@
 huggingface_hub
 numpy
 openai-whisper
+openvino
 openvino_genai
 pywin32
 pytest
+setuptools<82
 sounddevice
 torch
 transformers
@@ -11,3 +13,5 @@ parler-tts
 kokoro-onnx
 onnxruntime-openvino
 babelvox
+opencv-python
+silero-vad

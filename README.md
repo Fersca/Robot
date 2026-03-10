@@ -1,13 +1,16 @@
 # Robot
 
-A cross-platform desktop conversational assistant for Windows and Linux that combines local or external LLMs, voice input, voice output, and utilities for working with OpenVINO models on CPU, GPU, and NPU.
+A cross-platform desktop conversational assistant for Windows and Linux that combines local or external LLMs, voice input, voice output, OpenVINO model utilities, and an optional camera/panel runtime.
 
 The core of the project is [`robot.py`](./robot.py). From an interactive console it can:
 
 - load local LLMs from Hugging Face using OpenVINO GenAI
 - use an external OpenAI-compatible model
 - transcribe microphone input with classic Whisper or OpenVINO Whisper
+- preload Whisper on startup to reduce first-use delay
 - speak responses through multiple TTS backends
+- run continuous auto-listen with Silero VAD
+- react to camera presence events
 - benchmark models and record metrics
 - expose an OpenAI-compatible endpoint at `http://0.0.0.0:1311/v1/chat/completions`
 
@@ -17,13 +20,33 @@ The core of the project is [`robot.py`](./robot.py). From an interactive console
 
 1. It loads configuration from [`robot_config.json`](./robot_config.json).
 2. It loads model catalogs from `~/ov_models`.
-3. It tries to restore the previously used LLM.
-4. It waits for commands (`/models`, `/listen`, `/config`, etc.) or regular prompts.
-5. When it receives text:
+3. It preloads the configured Whisper backend.
+4. It tries to restore the previously used LLM.
+5. It waits for commands (`/models`, `/panel`, `/listen`, `/config`, etc.) or regular prompts.
+6. When it receives text:
    - it repeats it through TTS if `repeat=true`
    - otherwise it sends it to the active LLM and plays the response if audio is enabled
 
-It also supports continuous listening: once you enter `/listen`, `SPACE` starts or stops recording and `ESC` exits listen mode.
+It also supports:
+
+- manual `/listen` mode with `SPACE` start/stop and `ESC` exit
+- continuous `/auto_listen on` mode with Silero VAD
+- an optional `/panel` window for rendering the robot avatar, camera preview, toggles, and VAD bars
+- headless camera/vision processing even when the panel is closed
+
+## Presence And Panel
+
+The optional control panel shows a robot avatar, camera area, runtime switches, and audio/VAD bars.
+
+With a face detection model enabled, the assistant can:
+
+- detect when people appear in the camera
+- greet people when they arrive
+- say contextual lines when the number of visible people changes
+- say lines when it is left alone
+- interrupt its own audio and say `me cayo` if everyone disappears from the camera while it is speaking
+
+The camera worker is independent from the panel. That means `/camera on`, `/vision on`, and `/vision_events on` can keep running without rendering the panel window.
 
 ## Supported Backends
 
@@ -36,6 +59,7 @@ It also supports continuous listening: once you enter `/listen`, `SPACE` starts 
 
 - `openai-whisper`
 - `openvino_genai.WhisperPipeline`
+- Silero VAD for auto-listen segmentation
 
 ### Text-to-Speech
 
@@ -46,10 +70,30 @@ It also supports continuous listening: once you enter `/listen`, `SPACE` starts 
 - BabelVox
 - eSpeak NG
 
+## Functionality Overview
+
+- Local LLM chat through OpenVINO GenAI on CPU, GPU, NPU, or AUTO
+- External LLM chat through an OpenAI-compatible endpoint
+- Classic Whisper STT and OpenVINO Whisper STT
+- Whisper preload on startup
+- Continuous auto-listen with Silero VAD
+- Streaming TTS while the LLM is still generating
+- Multiple TTS backends: Windows SAPI, Parler, OpenVINO, Kokoro, BabelVox, eSpeak NG
+- Optional control panel with robot avatar, camera preview, switches, and VAD bars
+- Camera presence detection and reactive voice behavior
+- Face detection through OpenVINO vision models
+- Vision event logging and throttled console debugging
+- Headless camera/vision processing without opening the panel
+- Benchmarking and per-device compatibility tracking
+- OpenAI-compatible local server on port `1311`
+- OS-specific install scripts and requirements for Windows and Linux
+
 ## Important Files
 
 - [`robot.py`](./robot.py): main application
 - [`robot_config.json`](./robot_config.json): persisted configuration
+- [`AGENTS.md`](./AGENTS.md): repository context for coding agents
+- [`vision_models.json`](./vision_models.json): vision model catalog
 - [`ov_models/models.json`](./ov_models/models.json): LLM model catalog
 
 ## Screenshots
@@ -78,9 +122,15 @@ Example of a chat session in the interactive console.
 
 ![Chat example](./screenshots/chat_example.png)
 
+### Control Panel And Presence Detection
+
+The optional panel shows the robot avatar, camera area, runtime toggles, and audio/VAD bars. With vision enabled, the robot can detect people entering or leaving, greet them, and react when it is left alone.
+
+![Robot control panel](./screenshots/panel.png)
+
 ## Requirements
 
-The repository now ships OS-specific dependency files:
+The repository ships OS-specific dependency files:
 
 - [`requirements-windows.txt`](./requirements-windows.txt)
 - [`requirements-linux.txt`](./requirements-linux.txt)
@@ -122,7 +172,9 @@ For a first session, the recommended flow is:
 1. Run `/models`
 2. Choose a local LLM or configure `/llm_backend external`
 3. Adjust audio and STT settings with `/config`
-4. Try `/listen` or type prompts directly
+4. Optionally run `/panel`
+5. Optionally enable `/camera on`, `/vision on`, and `/vision_events on`
+6. Try `/listen`, `/auto_listen on`, or type prompts directly
 
 ## Main Commands
 
@@ -133,9 +185,25 @@ For a first session, the recommended flow is:
 /delete
 /config
 /voices
-/listen
 /llm_backend local|external
 /tts_backend windows|parler|openvino|kokoro|babelvox|espeakng
+/audio <on|off>
+/audio_inputs
+/audio_input_select
+/audio_monitor <on|off>
+/panel
+/camera <on|off>
+/vision <on|off>
+/vision_events <on|off>
+/vision_models
+/vision_select
+/vision_model
+/vision_labels
+/vision_device <name>
+/log <on|off|seconds>
+/repeat <true|false>
+/listen
+/auto_listen <on|off>
 /whisper_models
 /whisper_add
 /whisper_select
@@ -164,11 +232,13 @@ The main configuration lives in [`robot_config.json`](./robot_config.json). Amon
 - LLM backend (`local` or `external`)
 - current model and device (`CPU`, `GPU`, `NPU`, `AUTO`)
 - TTS backend
-- Whisper model and language
+- Whisper backend and model settings
 - audio on/off
 - TTS streaming
 - system prompt
 - `max_new_tokens`
+- camera, panel, and vision options
+- auto-listen and Silero VAD settings
 
 Catalogs, metrics, and compatibility data live under `~/ov_models`.
 

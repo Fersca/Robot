@@ -10,7 +10,7 @@ if ! command -v apt >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "[1/4] Installing system packages..."
+echo "[1/5] Installing system packages..."
 sudo apt update
 sudo apt install -y \
   python3 \
@@ -23,19 +23,22 @@ sudo apt install -y \
   clinfo
 
 if apt-cache show intel-opencl-icd >/dev/null 2>&1; then
-  echo "[1/4] Installing Intel OpenCL runtime..."
+  echo "[1/5] Installing Intel OpenCL runtime..."
   sudo apt install -y intel-opencl-icd
 fi
 
-echo "[2/4] Creating virtual environment..."
+echo "[2/5] Creating virtual environment..."
 python3 -m venv .venv
 
-echo "[3/4] Activating virtual environment..."
+echo "[3/5] Activating virtual environment..."
 source .venv/bin/activate
 
-echo "[4/4] Installing Python dependencies..."
+echo "[4/5] Installing Python dependencies..."
 python -m pip install --upgrade pip
 pip install -r requirements-linux.txt
+
+echo "[5/5] Verifying Silero VAD..."
+python -c "from silero_vad import load_silero_vad, VADIterator; model = load_silero_vad(); VADIterator(model, sampling_rate=16000); print('Silero VAD: OK')"
 
 echo ""
 echo "OpenCL check:"

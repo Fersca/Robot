@@ -1,0 +1,14 @@
+[
+  {
+    "id": "face-detection-retail-0004",
+    "display": "Face Detection Retail 0004",
+    "description": "Fast single-class face detector from the OpenVINO Open Model Zoo, good for a quick camera test.",
+    "local_dir": "face-detection-retail-0004",
+    "xml_url": "https://storage.openvinotoolkit.org/repositories/open_model_zoo/2022.1/models_bin/2/face-detection-retail-0004/FP32/face-detection-retail-0004.xml",
+    "bin_url": "https://storage.openvinotoolkit.org/repositories/open_model_zoo/2022.1/models_bin/2/face-detection-retail-0004/FP32/face-detection-retail-0004.bin",
+    "labels": [
+      "background",
+      "face"
+    ]
+  }
+]

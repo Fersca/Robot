@@ -7,28 +7,32 @@ This repository centers on `robot.py`, a cross-platform interactive assistant fo
 - Local LLM inference through `openvino_genai.LLMPipeline`
 - External OpenAI-compatible LLMs over HTTP
 - Speech-to-text with either classic `openai-whisper` or OpenVINO Whisper
+- Continuous VAD-driven auto-listen with Silero VAD
 - Text-to-speech through multiple interchangeable backends
+- Optional camera/panel UI with OpenVINO vision events
 - Benchmarking, model catalog management, and a lightweight OpenAI-compatible server
 
-The project is not structured as a package. The runtime is a single large CLI script with helper/prototype scripts beside it.
+The project is not structured as a package. The runtime is a single large CLI script.
 
 ## Primary Files
 
-- `robot.py`: main application, interactive shell, model management, STT/TTS runtime, OpenAI-compatible server, stats.
-- `robot_config.json`: persisted runtime configuration for LLM/STT/TTS behavior.
-- `ov_models/models.json`: local catalog of LLM models.
-- `tests/`: pytest suite covering cross-platform runtime behavior and packaging sanity.
+- `robot.py`: main application, interactive shell, model management, STT/TTS runtime, optional panel/camera runtime, OpenAI-compatible server, stats.
+- `robot_config.json`: persisted runtime configuration for LLM/STT/TTS/camera behavior.
+- `vision_models.json`: local vision model catalog.
+- `ov_models/models.json`: local LLM model catalog.
+- `tests/`: pytest suite covering runtime behavior and packaging sanity.
 
 ## Runtime Model
 
-`robot.py` starts an interactive REPL. It loads config, optionally restores a saved LLM, initializes the native voice layer when available, then waits for commands or free-form prompts.
+`robot.py` starts an interactive REPL. It loads config, initializes the native voice layer when available, preloads the configured Whisper backend, optionally restores a saved LLM, and then waits for commands or free-form prompts.
 
 Core flow:
 
 1. Load persisted catalogs and config from JSON files.
-2. Optionally auto-load the configured LLM.
-3. Accept slash commands for configuration, model selection, listen mode, benchmarking, and server startup.
-4. For plain text input:
+2. Preload the active Whisper backend.
+3. Optionally auto-load the configured LLM.
+4. Accept slash commands for configuration, model selection, panel/camera control, listen mode, benchmarking, and server startup.
+5. For plain text input:
    - If `repeat` is enabled, send text directly to TTS.
    - Otherwise build a chat prompt from history plus optional system prompt.
    - Stream model output to console.
@@ -51,6 +55,9 @@ Speech-to-text supports:
 
 - Classic Whisper through `openai-whisper`
 - OpenVINO Whisper through `ov_genai.WhisperPipeline`
+- Silero VAD for continuous auto-listen segmentation
+
+The app now attempts to preload the active Whisper backend on startup to reduce first-use latency.
 
 The `listen` flow records from the microphone until the user presses `SPACE`, transcribes the captured audio, then either:
 
@@ -58,6 +65,18 @@ The `listen` flow records from the microphone until the user presses `SPACE`, tr
 - sends it through the active chat pipeline
 
 Language selection is configurable. OpenVINO Whisper also supports model catalogs stored under `~/ov_models/whisper_models.json`.
+
+## Camera / Vision / Panel
+
+The runtime has a separate camera worker and an optional OpenCV panel window.
+
+- `/panel` opens the control panel UI.
+- The camera/vision worker can run headless even when the panel is closed.
+- `/camera on` can start camera processing without rendering the panel.
+- Vision detection can trigger reactive TTS messages when people enter, leave, or disappear.
+- If everyone leaves the camera while audio is actively playing, the app interrupts playback and says `me cayo`.
+- After that interruption, the next `0 -> 1` presence transition is intentionally suppressed once so the assistant does not immediately greet again.
+- Bounding boxes are only drawn when the panel is actually rendering.
 
 ## TTS Backends
 
@@ -75,8 +94,9 @@ Supported backends:
 Important implementation details:
 
 - OpenVINO TTS on GPU can run in an isolated worker process to avoid hangs locking the main process.
-- Streaming TTS is supported while the LLM is still generating text.
+- Streaming TTS is supported while the LLM is still generating.
 - `ESC` is used to interrupt generation or audio playback.
+- Audio cancellation can also be triggered internally by vision logic, not only by keyboard input.
 
 ## Persisted State
 
@@ -109,7 +129,14 @@ The main command surface includes:
 - `/models`, `/add_model`, `/delete`
 - `/llm_backend local|external`
 - `/tts_backend windows|parler|openvino|kokoro|babelvox|espeakng`
+- `/panel`
+- `/camera on|off`
+- `/vision on|off`
+- `/vision_events on|off`
+- `/vision_models`, `/vision_select`, `/vision_model`, `/vision_labels`, `/vision_device`
+- `/audio on|off`, `/audio_inputs`, `/audio_input_select`, `/audio_monitor on|off`
 - `/listen`
+- `/auto_listen on|off`
 - `/config`
 - `/whisper_models`, `/whisper_add`, `/whisper_select`
 - `/parler_models`, `/parler_add`, `/parler_select`
@@ -123,17 +150,15 @@ The main command surface includes:
 
 ## Platform Assumptions
 
-This project now targets both Windows and Linux, but not every helper script is equally portable.
-
 - The main app auto-detects the OS at startup.
 - Native Windows voice selection is Windows-only.
 - Linux uses `espeakng` as the default native fallback TTS backend.
 - Audio interaction still assumes an interactive console.
-- Some helper/debug scripts remain Intel/OpenVINO-focused experiments.
+- The panel is optional; camera/vision can still run headless.
 
 ## Dependencies
 
-This repo now provides OS-specific dependency files:
+This repo provides OS-specific dependency files:
 
 - `requirements-windows.txt`
 - `requirements-linux.txt`
@@ -145,6 +170,7 @@ Dependencies are still partly optional at runtime because several backends are l
 - `pywin32`
 - `numpy`
 - `sounddevice`
+- `silero-vad`
 - `openai-whisper`
 - `torch`
 - `transformers`
@@ -164,12 +190,13 @@ Dependencies are still partly optional at runtime because several backends are l
 ## Development Guidance For Codex
 
 - Start by reading `robot.py`. It contains nearly all real behavior.
-- Treat sibling scripts as experiments, diagnostics, or earlier prototypes unless the user explicitly wants them updated too.
 - Preserve JSON schema compatibility in `robot_config.json` and the `~/ov_models/*.json` catalogs.
 - Be careful with blocking audio/model initialization paths; many features lazily initialize and cache runtime objects.
 - Avoid breaking keyboard semantics:
   - `SPACE` starts/stops recording in listen mode
   - `ESC` interrupts generation or playback
+- Preserve the separation between the headless camera worker and the optional `/panel` renderer.
+- When changing vision event behavior, remember there is special logic around `me cayo` and suppressing the next join greeting.
 - If changing TTS/STT/LLM config keys, update both defaults and normalization in `default_robot_config()` and `load_robot_config()`.
 - If adding model catalogs, follow the existing `load_*`, `save_*`, `parse_*`, `*_status_line`, and `choose_*_interactive` patterns.
 - For documentation, describe the project as an interactive local voice assistant for Intel/OpenVINO-focused Windows and Linux environments.

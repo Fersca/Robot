@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import _thread
 import importlib
 import json
+import math
 import multiprocessing as mp
 import os
 import platform
@@ -26,6 +28,15 @@ from xml.sax.saxutils import escape as xml_escape
 IS_WINDOWS = platform.system().lower() == "windows"
 IS_LINUX = platform.system().lower() == "linux"
 PLATFORM_NAME = "windows" if IS_WINDOWS else "linux" if IS_LINUX else platform.system().lower()
+TTS_ACTIVITY_LOCK = threading.Lock()
+TTS_ACTIVITY_COUNT = 0
+TTS_PLAYING_EVENT = threading.Event()
+PLAYBACK_ACTIVITY_LOCK = threading.Lock()
+PLAYBACK_ACTIVITY_COUNT = 0
+AUDIO_PLAYBACK_EVENT = threading.Event()
+LAST_TTS_ACTIVITY_END_TS = 0.0
+APP_EXIT_REQUESTED = threading.Event()
+AUDIO_CANCEL_EVENT = threading.Event()
 
 try:
     import msvcrt  # type: ignore
@@ -201,6 +212,8 @@ PARLER_OV_MODELS_FILE = CACHE_DIR / "parler_models.json"
 OV_TTS_MODELS_FILE = CACHE_DIR / "openvino_tts_models.json"
 KOKORO_MODELS_FILE = CACHE_DIR / "kokoro_models.json"
 BABELVOX_MODELS_FILE = CACHE_DIR / "babelvox_models.json"
+VISION_MODELS_FILE = Path(__file__).resolve().parent / "vision_models.json"
+VISION_EVENT_RESPONSES_FILE = Path(__file__).resolve().parent / "vision_event_responses.json"
 
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
 DEFAULT_WHISPER_MODEL = "base"
@@ -1294,6 +1307,1122 @@ def initialize_native_voice_engine(config: dict):
         return None, None, str(exc)
 
 
+def ensure_camera_runtime(camera_runtime: dict) -> bool:
+    if camera_runtime.get("cv2") is None:
+        camera_runtime["cv2"] = ensure_dependency("cv2", "opencv-python", "OpenCV")
+        if camera_runtime["cv2"] is None:
+            return False
+    return True
+
+
+def load_vision_labels(labels_path: str) -> list[str]:
+    path = Path(str(labels_path or "").strip())
+    if not path.exists():
+        return []
+    try:
+        return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except Exception:
+        return []
+
+
+def vision_model_to_runtime_entry(entry: dict) -> dict | None:
+    if not isinstance(entry, dict):
+        return None
+    model_id = str(entry.get("id", "")).strip()
+    display = str(entry.get("display", "")).strip()
+    xml_url = str(entry.get("xml_url", "")).strip()
+    bin_url = str(entry.get("bin_url", "")).strip()
+    local_dir = str(entry.get("local_dir", "")).strip()
+    if not all([model_id, display, xml_url, bin_url, local_dir]):
+        return None
+    model_dir = CACHE_DIR / "vision_models" / local_dir
+    return {
+        "id": model_id,
+        "display": display,
+        "xml_url": xml_url,
+        "bin_url": bin_url,
+        "local_dir": local_dir,
+        "local": model_dir,
+        "xml_path": model_dir / f"{model_id}.xml",
+        "bin_path": model_dir / f"{model_id}.bin",
+        "labels": list(entry.get("labels", [])) if isinstance(entry.get("labels", []), list) else [],
+        "description": str(entry.get("description", "")).strip(),
+    }
+
+
+def load_vision_models() -> list[dict]:
+    if not VISION_MODELS_FILE.exists():
+        return []
+    try:
+        raw = json.loads(VISION_MODELS_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print_error_red(f"ERROR: Could not read vision model catalog: {exc}")
+        return []
+    if not isinstance(raw, list):
+        return []
+    models: list[dict] = []
+    for entry in raw:
+        parsed = vision_model_to_runtime_entry(entry)
+        if parsed is not None:
+            models.append(parsed)
+    return models
+
+
+def is_valid_openvino_xml_file(path: Path) -> bool:
+    if not path.exists() or path.suffix.lower() != ".xml":
+        return False
+    try:
+        head = path.read_text(encoding="utf-8", errors="ignore")[:256].lstrip()
+    except Exception:
+        return False
+    if "<!DOCTYPE html" in head or "<html" in head.lower():
+        return False
+    return "<net" in head or head.startswith("<?xml")
+
+
+def is_vision_model_downloaded(model: dict) -> bool:
+    return is_valid_openvino_xml_file(model["xml_path"]) and model["bin_path"].exists()
+
+
+def download_vision_model(model: dict) -> bool:
+    model["local"].mkdir(parents=True, exist_ok=True)
+    print(f"\n📥 Downloading vision model: {model['display']}")
+    try:
+        urllib.request.urlretrieve(model["xml_url"], str(model["xml_path"]))
+        urllib.request.urlretrieve(model["bin_url"], str(model["bin_path"]))
+        if not is_valid_openvino_xml_file(model["xml_path"]):
+            raise RuntimeError("downloaded XML is not a valid OpenVINO IR file")
+        labels = list(model.get("labels", []))
+        if labels:
+            (model["local"] / "labels.txt").write_text("\n".join(labels) + "\n", encoding="utf-8")
+        print("✅ Vision model download complete.\n")
+        return True
+    except Exception as exc:
+        print_error_red(f"ERROR: Failed to download vision model: {exc}")
+        return False
+
+
+def vision_model_status_line(model: dict, selected_id: str | None = None) -> str:
+    icon = "✅" if is_vision_model_downloaded(model) else "⬇️"
+    selected = " (current)" if selected_id and model["id"] == selected_id else ""
+    return f"{icon} {model['display']} [{model['id']}]{selected}"
+
+
+def list_vision_models(models: list[dict], selected_id: str | None = None) -> None:
+    print("\nVision models:\n")
+    if not models:
+        print("No vision models are configured.\n")
+        return
+    for idx, model in enumerate(models, 1):
+        print(f"  {idx}) {vision_model_status_line(model, selected_id)}")
+        if model.get("description"):
+            print(f"      {model['description']}")
+    print("")
+
+
+def choose_vision_model_interactive(models: list[dict], selected_id: str | None = None, allow_download: bool = True) -> dict | None:
+    if not models:
+        print("\nNo vision models available.\n")
+        return None
+    list_vision_models(models, selected_id)
+    while True:
+        value = input("Choose vision model number (or 'cancel'): ").strip().lower()
+        if value == "cancel":
+            return None
+        if not value.isdigit() or not (1 <= int(value) <= len(models)):
+            print("Invalid option.")
+            continue
+        selected = models[int(value) - 1]
+        if not is_vision_model_downloaded(selected):
+            if not allow_download:
+                print("That model is not downloaded yet.")
+                continue
+            if not download_vision_model(selected):
+                return None
+        return selected
+
+
+def choose_vision_device_interactive(selected_device: str | None = None) -> str | None:
+    options = ["CPU", "GPU", "NPU", "AUTO"]
+    current = str(selected_device or "AUTO").strip().upper() or "AUTO"
+    print("\nVision devices:\n")
+    for idx, device in enumerate(options, 1):
+        marker = " (current)" if device == current else ""
+        print(f"  {idx}) {device}{marker}")
+    print("")
+    while True:
+        value = input("Choose vision device number (or 'cancel'): ").strip().lower()
+        if value == "cancel":
+            return None
+        if not value.isdigit() or not (1 <= int(value) <= len(options)):
+            print("Invalid option.")
+            continue
+        return options[int(value) - 1]
+
+
+def ensure_vision_runtime(camera_runtime: dict, config: dict) -> bool:
+    if not ensure_camera_runtime(camera_runtime):
+        return False
+    model_path_value = str(config.get("vision_model_path", "")).strip()
+    if not model_path_value:
+        print_error_red("ERROR: vision_model_path is empty. Set it before enabling vision.")
+        return False
+    model_path = Path(model_path_value)
+    if not model_path.exists():
+        print_error_red(f"ERROR: Vision model file does not exist: {model_path}")
+        return False
+
+    active_key = (
+        str(model_path.resolve()),
+        str(config.get("vision_device", "AUTO")).strip().upper(),
+    )
+    if camera_runtime.get("vision_active_key") == active_key and camera_runtime.get("vision_compiled_model") is not None:
+        return True
+
+    try:
+        ov_mod = importlib.import_module("openvino")
+    except Exception:
+        ov_mod = ensure_dependency("openvino", "openvino", "OpenVINO")
+        if ov_mod is None:
+            return False
+
+    try:
+        core = ov_mod.Core()
+        model = core.read_model(str(model_path))
+        compiled = core.compile_model(model, active_key[1])
+    except Exception as exc:
+        print_error_red(f"ERROR: Failed to initialize vision model: {exc}")
+        return False
+
+    input_tensor = compiled.input(0)
+    shape = list(input_tensor.shape)
+    if len(shape) != 4:
+        print_error_red(f"ERROR: Unsupported vision model input shape: {shape}")
+        return False
+
+    camera_runtime["vision_core"] = core
+    camera_runtime["vision_compiled_model"] = compiled
+    camera_runtime["vision_input_shape"] = shape
+    camera_runtime["vision_active_key"] = active_key
+    labels = load_vision_labels(str(config.get("vision_labels_path", "")).strip())
+    if not labels:
+        selected_id = str(config.get("vision_model_id", "")).strip()
+        if selected_id:
+            selected = next((m for m in load_vision_models() if m["id"] == selected_id), None)
+            if selected is not None:
+                labels = list(selected.get("labels", []))
+    camera_runtime["vision_labels"] = labels
+    model_id = str(config.get("vision_model_id", "")).strip() or model_path.stem
+    print(f"\n✅ Vision model loaded on {active_key[1]}: {model_id}\n")
+    return True
+
+
+def preprocess_vision_frame(frame, cv2_mod, np_mod, input_shape: list[int]):
+    _, _, input_h, input_w = input_shape
+    resized = cv2_mod.resize(frame, (int(input_w), int(input_h)))
+    blob = resized.transpose(2, 0, 1)[None, ...].astype(np_mod.float32)
+    return blob
+
+
+def parse_detection_results(raw_output, frame_shape, threshold: float, labels: list[str]) -> list[dict]:
+    np_mod = importlib.import_module("numpy")
+    arr = np_mod.array(raw_output)
+    detections: list[dict] = []
+    frame_h, frame_w = frame_shape[:2]
+
+    if arr.ndim == 4 and arr.shape[-1] >= 7:
+        rows = arr.reshape(-1, arr.shape[-1])
+        for row in rows:
+            confidence = float(row[2])
+            if confidence < threshold:
+                continue
+            class_id = int(row[1])
+            x1 = max(0, min(frame_w - 1, int(float(row[3]) * frame_w)))
+            y1 = max(0, min(frame_h - 1, int(float(row[4]) * frame_h)))
+            x2 = max(0, min(frame_w - 1, int(float(row[5]) * frame_w)))
+            y2 = max(0, min(frame_h - 1, int(float(row[6]) * frame_h)))
+            label = labels[class_id] if 0 <= class_id < len(labels) else f"class_{class_id}"
+            detections.append({"label": label, "score": confidence, "box": (x1, y1, x2, y2)})
+        return detections
+
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim == 2 and arr.shape[-1] >= 6:
+        rows = arr
+        for row in rows:
+            confidence = float(row[4])
+            if confidence < threshold:
+                continue
+            class_id = int(row[5])
+            coords = [float(v) for v in row[:4]]
+            normalized = max(coords) <= 1.5
+            if normalized:
+                x1 = max(0, min(frame_w - 1, int(coords[0] * frame_w)))
+                y1 = max(0, min(frame_h - 1, int(coords[1] * frame_h)))
+                x2 = max(0, min(frame_w - 1, int(coords[2] * frame_w)))
+                y2 = max(0, min(frame_h - 1, int(coords[3] * frame_h)))
+            else:
+                x1 = max(0, min(frame_w - 1, int(coords[0])))
+                y1 = max(0, min(frame_h - 1, int(coords[1])))
+                x2 = max(0, min(frame_w - 1, int(coords[2])))
+                y2 = max(0, min(frame_h - 1, int(coords[3])))
+            label = labels[class_id] if 0 <= class_id < len(labels) else f"class_{class_id}"
+            detections.append({"label": label, "score": confidence, "box": (x1, y1, x2, y2)})
+        return detections
+
+    return []
+
+
+def annotate_frame_with_detections(frame, detections: list[dict], cv2_mod):
+    for det in detections:
+        x1, y1, x2, y2 = det["box"]
+        label = det["label"]
+        score = det["score"]
+        cv2_mod.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2_mod.putText(
+            frame,
+            f"{label} {score:.2f}",
+            (x1, max(20, y1 - 8)),
+            cv2_mod.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            1,
+            cv2_mod.LINE_AA,
+        )
+    return frame
+
+
+def format_vision_debug_output(raw_output, detections: list[dict]) -> str:
+    np_mod = importlib.import_module("numpy")
+    arr = np_mod.array(raw_output)
+    payload = {
+        "shape": list(arr.shape),
+        "dtype": str(arr.dtype),
+        "detection_count": len(detections),
+        "detections": detections,
+    }
+    text = json.dumps(payload, ensure_ascii=False)
+    if len(text) > 2000:
+        text = text[:2000] + "...(truncated)"
+    return text
+
+
+def format_vad_debug_output(payload: dict) -> str:
+    text = json.dumps(payload, ensure_ascii=False)
+    if len(text) > 1200:
+        text = text[:1200] + "...(truncated)"
+    return text
+
+
+def should_emit_vision_log(camera_runtime: dict, now_ts: float | None = None) -> bool:
+    if not bool(camera_runtime.get("vision_log_enabled", False)):
+        return False
+    if now_ts is None:
+        now_ts = time.monotonic()
+    last_ts = float(camera_runtime.get("vision_log_last_ts", 0.0))
+    interval_s = max(0.1, float(camera_runtime.get("vision_log_interval_s", 1.0)))
+    if (now_ts - last_ts) < interval_s:
+        return False
+    camera_runtime["vision_log_last_ts"] = now_ts
+    return True
+
+
+def should_emit_auto_listen_log(auto_listen_runtime: dict, now_ts: float | None = None) -> bool:
+    config = auto_listen_runtime.get("voice_config")
+    if not isinstance(config, dict) or not bool(config.get("vision_log_enabled", False)):
+        return False
+    if now_ts is None:
+        now_ts = time.monotonic()
+    last_ts = float(auto_listen_runtime.get("vad_log_last_ts", 0.0))
+    interval_s = max(0.1, float(config.get("vision_log_interval_s", 1.0)))
+    if (now_ts - last_ts) < interval_s:
+        return False
+    auto_listen_runtime["vad_log_last_ts"] = now_ts
+    return True
+
+
+def should_process_vision_events(camera_runtime: dict, now_ts: float | None = None) -> bool:
+    if not bool(camera_runtime.get("vision_event_processing_enabled", True)):
+        return False
+    if now_ts is None:
+        now_ts = time.monotonic()
+    last_ts = float(camera_runtime.get("vision_event_last_ts", 0.0))
+    interval_s = max(0.1, float(camera_runtime.get("vision_log_interval_s", 1.0)))
+    if (now_ts - last_ts) < interval_s:
+        return False
+    camera_runtime["vision_event_last_ts"] = now_ts
+    return True
+
+
+def load_vision_event_responses() -> dict[str, list[str]]:
+    defaults = {
+        "first_person_joined": ["Hola, como andas?"],
+        "more_people_joined": ["Se sumo una persona, ahora hay: {count}"],
+        "fewer_people_left": ["Se fue una persona."],
+        "alone_again": ["Me dejaron solo."],
+    }
+    if not VISION_EVENT_RESPONSES_FILE.exists():
+        return defaults
+    try:
+        raw = json.loads(VISION_EVENT_RESPONSES_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print_error_red(f"ERROR: Could not read vision event responses: {exc}")
+        return defaults
+    if not isinstance(raw, dict):
+        return defaults
+    merged: dict[str, list[str]] = {}
+    for key, fallback in defaults.items():
+        values = raw.get(key, fallback)
+        if isinstance(values, list):
+            cleaned = [str(item).strip() for item in values if str(item).strip()]
+            merged[key] = cleaned or fallback
+        else:
+            merged[key] = fallback
+    return merged
+
+
+def choose_vision_event_response(category: str, count: int) -> str | None:
+    responses = load_vision_event_responses()
+    options = list(responses.get(category, []))
+    if not options:
+        return None
+    template = random.choice(options)
+    try:
+        return str(template).format(count=count)
+    except Exception:
+        return str(template)
+
+
+def set_robot_face_gesture(camera_runtime: dict, gesture: str, duration_s: float = 1.2) -> None:
+    camera_runtime["robot_face_gesture"] = str(gesture or "").strip()
+    camera_runtime["robot_face_gesture_until"] = time.monotonic() + max(0.1, float(duration_s))
+
+
+def handle_vision_tick(camera_runtime: dict, detections: list[dict]) -> str | None:
+    current_count = len(detections)
+    previous_count = int(camera_runtime.get("vision_last_detection_count", 0))
+    camera_runtime["vision_last_detection_count"] = current_count
+
+    if current_count == previous_count:
+        return None
+    if previous_count == 0 and current_count > 0:
+        set_robot_face_gesture(camera_runtime, "join")
+        if bool(camera_runtime.get("suppress_next_join_after_interrupt", False)):
+            camera_runtime["suppress_next_join_after_interrupt"] = False
+            return None
+        return choose_vision_event_response("first_person_joined", current_count)
+    if current_count > previous_count:
+        set_robot_face_gesture(camera_runtime, "join")
+        return choose_vision_event_response("more_people_joined", current_count)
+    if current_count == 0:
+        set_robot_face_gesture(camera_runtime, "leave")
+        if is_audio_playback_active() or is_tts_active():
+            camera_runtime["suppress_next_join_after_interrupt"] = True
+            return "__INTERRUPT_AUDIO__:me cayo"
+        return choose_vision_event_response("alone_again", current_count)
+    set_robot_face_gesture(camera_runtime, "leave")
+    return choose_vision_event_response("fewer_people_left", current_count)
+
+
+def _vision_event_tts_worker(camera_runtime: dict) -> None:
+    stop_event = camera_runtime.get("stop_event")
+    event_queue = camera_runtime.get("vision_event_queue")
+    if stop_event is None or not isinstance(event_queue, queue.Queue):
+        return
+    while not stop_event.is_set() or not event_queue.empty():
+        try:
+            message = event_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if not message:
+            continue
+        config = camera_runtime.get("voice_config")
+        tts_runtime = camera_runtime.get("tts_runtime")
+        speaker = camera_runtime.get("speaker")
+        if not isinstance(config, dict) or not bool(config.get("audio_enabled", True)):
+            continue
+        if not isinstance(tts_runtime, dict):
+            continue
+        if is_audio_playback_active() or is_tts_active():
+            continue
+        try:
+            speak_text_backend(
+                speaker,
+                str(message),
+                config,
+                tts_runtime,
+                allow_interrupt=True,
+            )
+        except Exception as exc:
+            print_error_red(f"ERROR: Vision event TTS failed: {exc}")
+
+
+def emit_vision_event_message(camera_runtime: dict, message: str) -> None:
+    if not message:
+        return
+    if is_audio_playback_active() or is_tts_active():
+        return
+    event_queue = camera_runtime.get("vision_event_queue")
+    if not isinstance(event_queue, queue.Queue):
+        return
+    try:
+        event_queue.put_nowait(str(message))
+    except queue.Full:
+        pass
+
+
+def interrupt_audio_and_speak(camera_runtime: dict, message: str) -> None:
+    if not message:
+        return
+    config = camera_runtime.get("voice_config")
+    tts_runtime = camera_runtime.get("tts_runtime")
+    speaker = camera_runtime.get("speaker")
+    if not isinstance(config, dict) or not bool(config.get("audio_enabled", True)):
+        return
+    if not isinstance(tts_runtime, dict):
+        return
+    request_audio_cancel()
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and (is_audio_playback_active() or is_tts_active()):
+        time.sleep(0.02)
+    clear_audio_cancel()
+    try:
+        speak_text_backend(
+            speaker,
+            str(message),
+            config,
+            tts_runtime,
+            allow_interrupt=True,
+        )
+    except Exception as exc:
+        print_error_red(f"ERROR: Vision interrupt TTS failed: {exc}")
+
+
+def open_camera_capture(cv2_mod, device_index: int):
+    backends: list[int | None] = [None]
+    if PLATFORM_NAME == "windows":
+        for attr_name in ("CAP_DSHOW", "CAP_MSMF"):
+            backend = getattr(cv2_mod, attr_name, None)
+            if backend is not None:
+                backends.insert(0, backend)
+    elif PLATFORM_NAME == "linux":
+        backend = getattr(cv2_mod, "CAP_V4L2", None)
+        if backend is not None:
+            backends.insert(0, backend)
+
+    last_cap = None
+    for backend in backends:
+        cap = cv2_mod.VideoCapture(device_index) if backend is None else cv2_mod.VideoCapture(device_index, backend)
+        last_cap = cap
+        try:
+            if cap is not None and cap.isOpened():
+                return cap
+        except Exception:
+            pass
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            pass
+    return last_cap
+
+
+def list_camera_devices(camera_runtime: dict, max_devices: int = 10) -> list[tuple[int, str]]:
+    if not ensure_camera_runtime(camera_runtime):
+        return []
+    cv2_mod = camera_runtime["cv2"]
+    found: list[tuple[int, str]] = []
+    for idx in range(max_devices):
+        cap = open_camera_capture(cv2_mod, idx)
+        try:
+            if cap is None or not cap.isOpened():
+                continue
+            ok, _frame = cap.read()
+            if ok:
+                found.append((idx, f"Camera {idx}"))
+        finally:
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+    return found
+
+
+def stop_camera_preview(camera_runtime: dict) -> None:
+    stop_event = camera_runtime.get("stop_event")
+    thread = camera_runtime.get("thread")
+    event_thread = camera_runtime.get("vision_event_thread")
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2)
+    if event_thread is not None and event_thread.is_alive():
+        event_thread.join(timeout=2)
+    camera_runtime["thread"] = None
+    camera_runtime["vision_event_thread"] = None
+    camera_runtime["vision_event_queue"] = None
+    camera_runtime["stop_event"] = None
+    camera_runtime["active_device_index"] = None
+    camera_runtime["camera_enabled"] = False
+    camera_runtime["panel_enabled"] = False
+    camera_runtime["panel_button_rects"] = {}
+    camera_runtime["panel_action_queue"] = None
+
+
+def draw_robot_face(frame, np_mod, cv2_mod, rect: tuple[int, int, int, int], *, speaking: bool, listening: bool, gesture: str, visual_effects_enabled: bool) -> None:
+    x, y, w, h = rect
+    face_bg = (32, 38, 46)
+    accent = (80, 190, 255)
+    accent_dim = (70, 110, 140)
+    metal = (180, 190, 205)
+    dark = (18, 24, 28)
+    frame[y:y + h, x:x + w] = face_bg
+
+    t = time.monotonic()
+    ear_w = 28
+    ear_h = 110
+    ear_base_y = y + 96
+    ear_offset = 0
+    if visual_effects_enabled and listening:
+        ear_offset = int(10 * (0.5 + 0.5 * math.sin(t * 14.0)))
+    left_ear = ((x + 16, ear_base_y - ear_offset), (x + 16 + ear_w, ear_base_y + ear_h - ear_offset))
+    right_ear = ((x + w - 16 - ear_w, ear_base_y - ear_offset), (x + w - 16, ear_base_y + ear_h - ear_offset))
+    cv2_mod.rectangle(frame, left_ear[0], left_ear[1], accent if listening else accent_dim, -1)
+    cv2_mod.rectangle(frame, right_ear[0], right_ear[1], accent if listening else accent_dim, -1)
+
+    head_x1 = x + 48
+    head_y1 = y + 52
+    head_x2 = x + w - 48
+    head_y2 = y + h - 44
+    cv2_mod.rectangle(frame, (head_x1, head_y1), (head_x2, head_y2), metal, -1)
+    cv2_mod.rectangle(frame, (head_x1 + 10, head_y1 + 10), (head_x2 - 10, head_y2 - 10), (95, 102, 112), -1)
+
+    eye_y = y + 150
+    eye_w = 52
+    eye_h = 28
+    blink = visual_effects_enabled and (math.sin(t * 1.4) > 0.985)
+    if gesture == "join":
+        eye_h = 34
+    elif gesture == "leave":
+        eye_h = 18
+    if blink:
+        eye_h = 6
+    left_eye_center = (x + 112, eye_y)
+    right_eye_center = (x + w - 112, eye_y)
+    cv2_mod.ellipse(frame, left_eye_center, (eye_w, eye_h), 0, 0, 360, dark, -1)
+    cv2_mod.ellipse(frame, right_eye_center, (eye_w, eye_h), 0, 0, 360, dark, -1)
+    if not blink:
+        pupil_shift = 0
+        if gesture == "join":
+            pupil_shift = -4
+        elif gesture == "leave":
+            pupil_shift = 4
+        cv2_mod.circle(frame, (left_eye_center[0] + pupil_shift, left_eye_center[1]), 8, accent, -1)
+        cv2_mod.circle(frame, (right_eye_center[0] + pupil_shift, right_eye_center[1]), 8, accent, -1)
+
+    mouth_x1 = x + 96
+    mouth_x2 = x + w - 96
+    mouth_cy = y + 286
+    mouth_open = 10
+    mouth_curve = 0
+    if visual_effects_enabled and speaking:
+        phase_a = 0.5 + 0.5 * math.sin(t * 13.0)
+        phase_b = 0.5 + 0.5 * math.sin(t * 21.0 + 0.9)
+        mouth_open = 6 + int(10 * phase_a + 8 * phase_b)
+        mouth_curve = int(6 * math.sin(t * 9.0 + 0.4))
+    elif gesture == "join":
+        mouth_open = 18
+        mouth_curve = -6
+    elif gesture == "leave":
+        mouth_open = 4
+        mouth_curve = 6
+    mouth_color = accent if speaking else accent_dim
+    outer_pts = np_mod.array(
+        [
+            [mouth_x1, mouth_cy - mouth_open + mouth_curve],
+            [mouth_x2, mouth_cy - mouth_open - mouth_curve],
+            [mouth_x2, mouth_cy + mouth_open - mouth_curve],
+            [mouth_x1, mouth_cy + mouth_open + mouth_curve],
+        ],
+        dtype=np_mod.int32,
+    )
+    inner_pts = np_mod.array(
+        [
+            [mouth_x1 + 8, mouth_cy - max(2, mouth_open - 6) + mouth_curve // 2],
+            [mouth_x2 - 8, mouth_cy - max(2, mouth_open - 6) - mouth_curve // 2],
+            [mouth_x2 - 8, mouth_cy + max(2, mouth_open - 6) - mouth_curve // 2],
+            [mouth_x1 + 8, mouth_cy + max(2, mouth_open - 6) + mouth_curve // 2],
+        ],
+        dtype=np_mod.int32,
+    )
+    cv2_mod.fillConvexPoly(frame, outer_pts, dark)
+    cv2_mod.fillConvexPoly(frame, inner_pts, mouth_color)
+
+    badge_color = accent if visual_effects_enabled else accent_dim
+    cv2_mod.circle(frame, (x + (w // 2), y + h - 86), 18, badge_color, -1)
+    cv2_mod.putText(frame, "R", (x + (w // 2) - 8, y + h - 79), cv2_mod.FONT_HERSHEY_SIMPLEX, 0.7, dark, 2, cv2_mod.LINE_AA)
+
+
+def build_panel_frame(np_mod, cv2_mod, camera_frame, camera_enabled: bool, camera_device_index: int | None, metrics: list[dict], button_specs: list[dict], show_audio_monitor: bool, face_state: dict):
+    panel_w = 1440
+    panel_h = 760
+    frame = np_mod.zeros((panel_h, panel_w, 3), dtype=np_mod.uint8)
+    frame[:, :] = (20, 20, 20)
+
+    face_x = 24
+    camera_y = 72
+    face_w = 280
+    camera_x = face_x + face_w + 24
+    camera_w = 700
+    camera_h = 616
+    sidebar_x = camera_x + camera_w + 28
+    sidebar_y = 72
+    sidebar_w = panel_w - sidebar_x - 24
+
+    frame[camera_y - 18:camera_y + camera_h + 18, face_x - 18:face_x + face_w + 18] = (32, 32, 32)
+    frame[camera_y - 18:camera_y + camera_h + 18, camera_x - 18:camera_x + camera_w + 18] = (32, 32, 32)
+    frame[sidebar_y - 18:panel_h - 24, sidebar_x - 18:panel_w - 24] = (28, 28, 28)
+
+    cv2_mod.putText(frame, "Robot Control Panel", (24, 36), cv2_mod.FONT_HERSHEY_SIMPLEX, 1.0, (235, 235, 235), 2, cv2_mod.LINE_AA)
+    cv2_mod.putText(frame, "Avatar", (face_x, 62), cv2_mod.FONT_HERSHEY_SIMPLEX, 0.7, (210, 210, 210), 1, cv2_mod.LINE_AA)
+    cv2_mod.putText(frame, "Camera", (camera_x, 62), cv2_mod.FONT_HERSHEY_SIMPLEX, 0.7, (210, 210, 210), 1, cv2_mod.LINE_AA)
+    cv2_mod.putText(frame, "Controls", (sidebar_x, 62), cv2_mod.FONT_HERSHEY_SIMPLEX, 0.7, (210, 210, 210), 1, cv2_mod.LINE_AA)
+    draw_robot_face(
+        frame,
+        np_mod,
+        cv2_mod,
+        (face_x, camera_y, face_w, camera_h),
+        speaking=bool(face_state.get("speaking", False)),
+        listening=bool(face_state.get("listening", False)),
+        gesture=str(face_state.get("gesture", "")),
+        visual_effects_enabled=bool(face_state.get("visual_effects_enabled", True)),
+    )
+
+    if camera_frame is not None:
+        resized = cv2_mod.resize(camera_frame, (camera_w, camera_h))
+        frame[camera_y:camera_y + camera_h, camera_x:camera_x + camera_w] = resized
+    else:
+        frame[camera_y:camera_y + camera_h, camera_x:camera_x + camera_w] = (35, 35, 35)
+        status = "Camera Off" if not camera_enabled else "Waiting for camera..."
+        device_text = f"device={camera_device_index}" if camera_device_index is not None else "device=none"
+        cv2_mod.putText(frame, status, (camera_x + 165, camera_y + 290), cv2_mod.FONT_HERSHEY_SIMPLEX, 1.0, (180, 180, 180), 2, cv2_mod.LINE_AA)
+        cv2_mod.putText(frame, device_text, (camera_x + 215, camera_y + 330), cv2_mod.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 1, cv2_mod.LINE_AA)
+
+    button_h = 34
+    button_pitch = 40
+    button_rects: dict[str, tuple[int, int, int, int]] = {}
+    for idx, spec in enumerate(button_specs):
+        x1 = sidebar_x
+        y1 = sidebar_y + idx * button_pitch
+        x2 = x1 + sidebar_w
+        y2 = y1 + button_h
+        active = bool(spec.get("active", False))
+        color = (50, 145, 70) if active else (70, 70, 70)
+        frame[y1:y2, x1:x2] = color
+        cv2_mod.rectangle(frame, (x1, y1), (x2, y2), (110, 110, 110), 1)
+        label = str(spec.get("label", "Toggle"))
+        state_text = "ON" if active else "OFF"
+        cv2_mod.putText(frame, f"{label}", (x1 + 12, y1 + 23), cv2_mod.FONT_HERSHEY_SIMPLEX, 0.58, (245, 245, 245), 1, cv2_mod.LINE_AA)
+        cv2_mod.putText(frame, state_text, (x2 - 56, y1 + 23), cv2_mod.FONT_HERSHEY_SIMPLEX, 0.54, (240, 240, 240), 1, cv2_mod.LINE_AA)
+        button_rects[str(spec.get("action", label))] = (x1, y1, x2, y2)
+
+    metrics_y = sidebar_y + len(button_specs) * button_pitch + 12
+    if show_audio_monitor:
+        metrics_frame = build_audio_monitor_frame(np_mod, 0.0, 1.0, False, width=sidebar_w, height=250, metrics=metrics)
+        frame[metrics_y:metrics_y + 250, sidebar_x:sidebar_x + sidebar_w] = metrics_frame
+        cv2_mod.putText(frame, "Audio / VAD", (sidebar_x, metrics_y - 10), cv2_mod.FONT_HERSHEY_SIMPLEX, 0.65, (210, 210, 210), 1, cv2_mod.LINE_AA)
+        for idx, metric in enumerate(metrics):
+            label_y = metrics_y + 40 + idx * 42
+            cv2_mod.putText(
+                frame,
+                str(metric.get("label", "")),
+                (sidebar_x + 8, label_y),
+                cv2_mod.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (230, 230, 230),
+                1,
+                cv2_mod.LINE_AA,
+            )
+    else:
+        frame[metrics_y:metrics_y + 250, sidebar_x:sidebar_x + sidebar_w] = (35, 35, 35)
+        cv2_mod.putText(frame, "Audio / VAD", (sidebar_x, metrics_y - 10), cv2_mod.FONT_HERSHEY_SIMPLEX, 0.65, (210, 210, 210), 1, cv2_mod.LINE_AA)
+        cv2_mod.putText(frame, "Audio monitor is off", (sidebar_x + 70, metrics_y + 120), cv2_mod.FONT_HERSHEY_SIMPLEX, 0.8, (160, 160, 160), 2, cv2_mod.LINE_AA)
+    return frame, button_rects
+
+
+def ensure_camera_worker(camera_runtime: dict, config: dict) -> bool:
+    if not ensure_camera_runtime(camera_runtime):
+        return False
+    camera_runtime["voice_config"] = config
+    if camera_runtime.get("thread") is not None and camera_runtime["thread"].is_alive():
+        return True
+    stop_event = threading.Event()
+    camera_runtime["stop_event"] = stop_event
+    camera_runtime["vision_event_queue"] = queue.Queue(maxsize=32)
+    camera_runtime["panel_action_queue"] = queue.Queue(maxsize=32)
+    event_thread = threading.Thread(target=_vision_event_tts_worker, args=(camera_runtime,), daemon=True)
+    camera_runtime["vision_event_thread"] = event_thread
+    event_thread.start()
+    thread = threading.Thread(target=_camera_preview_worker, args=(camera_runtime, None), daemon=True)
+    camera_runtime["thread"] = thread
+    thread.start()
+    return True
+
+
+def start_camera_panel(camera_runtime: dict, config: dict) -> bool:
+    camera_runtime["panel_enabled"] = True
+    return ensure_camera_worker(camera_runtime, config)
+
+
+def set_camera_enabled(camera_runtime: dict, config: dict, enabled: bool) -> bool:
+    camera_runtime["voice_config"] = config
+    if not enabled:
+        config["camera_enabled"] = False
+        camera_runtime["camera_enabled"] = False
+        camera_runtime["active_device_index"] = None
+        save_robot_config(config)
+        print("\n✅ camera = off\n")
+        return True
+
+    if not ensure_camera_runtime(camera_runtime):
+        return False
+    saved_device_index = int(config.get("camera_device_index", 0))
+    cv2_mod = camera_runtime.get("cv2")
+    device_index = None
+    if cv2_mod is not None:
+        saved_cap = open_camera_capture(cv2_mod, saved_device_index)
+        try:
+            if saved_cap is not None and saved_cap.isOpened():
+                ok, _frame = saved_cap.read()
+                if ok:
+                    device_index = saved_device_index
+        finally:
+            with contextlib.suppress(Exception):
+                if saved_cap is not None:
+                    saved_cap.release()
+    if device_index is None:
+        devices = list_camera_devices(camera_runtime)
+        if not devices:
+            print_error_red("ERROR: No camera devices were detected.")
+            return False
+        print("\nAvailable cameras:\n")
+        for number, (listed_device_index, label) in enumerate(devices, 1):
+            marker = " (current)" if int(config.get("camera_device_index", 0)) == listed_device_index else ""
+            print(f"  {number}) {label} [index={listed_device_index}]{marker}")
+        while True:
+            value = input("\nChoose camera number (or 'cancel'): ").strip().lower()
+            if value == "cancel":
+                print("\nCancelled.\n")
+                return False
+            if not value.isdigit() or not (1 <= int(value) <= len(devices)):
+                print("Invalid option.")
+                continue
+            device_index = devices[int(value) - 1][0]
+            break
+    config["camera_enabled"] = True
+    config["camera_device_index"] = int(device_index)
+    camera_runtime["camera_enabled"] = True
+    camera_runtime["active_device_index"] = int(device_index)
+    save_robot_config(config)
+    print(f"\n✅ camera = on | device {device_index}\n")
+    return True
+
+
+def _camera_preview_worker(camera_runtime: dict, _device_index_unused) -> None:
+    cv2_mod = camera_runtime.get("cv2")
+    stop_event = camera_runtime.get("stop_event")
+    if cv2_mod is None or stop_event is None:
+        return
+    window_name = "Robot Control Panel"
+    action_queue = camera_runtime.get("panel_action_queue")
+    np_mod = importlib.import_module("numpy")
+    cap = None
+    opened_device_index = None
+    window_open = False
+
+    def mouse_callback(event, x, y, _flags, _param):
+        if event != cv2_mod.EVENT_LBUTTONUP:
+            return
+        rects = camera_runtime.get("panel_button_rects") or {}
+        if not isinstance(action_queue, queue.Queue):
+            return
+        for action, rect in rects.items():
+            x1, y1, x2, y2 = rect
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                with contextlib.suppress(queue.Full):
+                    action_queue.put_nowait(str(action))
+                break
+
+    try:
+        while not stop_event.is_set():
+            loop_started_ts = time.monotonic()
+            config = camera_runtime.get("voice_config", {})
+            panel_enabled = bool(camera_runtime.get("panel_enabled", False))
+            if panel_enabled and not window_open:
+                cv2_mod.namedWindow(window_name)
+                cv2_mod.setMouseCallback(window_name, mouse_callback)
+                window_open = True
+            elif not panel_enabled and window_open:
+                with contextlib.suppress(Exception):
+                    cv2_mod.destroyWindow(window_name)
+                camera_runtime["panel_button_rects"] = {}
+                window_open = False
+            desired_camera_enabled = bool(config.get("camera_enabled", False))
+            desired_device_index = int(config.get("camera_device_index", 0)) if desired_camera_enabled else None
+            if desired_camera_enabled:
+                if cap is None or opened_device_index != desired_device_index:
+                    if cap is not None:
+                        with contextlib.suppress(Exception):
+                            cap.release()
+                    cap = open_camera_capture(cv2_mod, int(desired_device_index))
+                    opened_device_index = desired_device_index
+                    if cap is None or not cap.isOpened():
+                        print_error_red(f"ERROR: Could not open camera device {desired_device_index}.")
+                        cap = None
+                        config["camera_enabled"] = False
+                        camera_runtime["camera_enabled"] = False
+                        save_robot_config(config)
+                camera_runtime["active_device_index"] = desired_device_index
+            else:
+                if cap is not None:
+                    with contextlib.suppress(Exception):
+                        cap.release()
+                cap = None
+                opened_device_index = None
+                camera_runtime["active_device_index"] = None
+
+            frame = None
+            if cap is not None:
+                ok, frame = cap.read()
+                if not ok:
+                    print_error_red(f"ERROR: Failed to read from camera device {opened_device_index}.")
+                    with contextlib.suppress(Exception):
+                        cap.release()
+                    cap = None
+                    opened_device_index = None
+                    frame = None
+                    config["camera_enabled"] = False
+                    camera_runtime["camera_enabled"] = False
+                    save_robot_config(config)
+
+            if frame is not None and bool(camera_runtime.get("vision_enabled", False)):
+                try:
+                    compiled = camera_runtime.get("vision_compiled_model")
+                    input_shape = camera_runtime.get("vision_input_shape")
+                    if compiled is not None and input_shape is not None:
+                        blob = preprocess_vision_frame(frame, cv2_mod, np_mod, input_shape)
+                        result = compiled([blob])
+                        raw_output = next(iter(result.values()))
+                        threshold = float(camera_runtime.get("vision_threshold", 0.4))
+                        labels = list(camera_runtime.get("vision_labels", []))
+                        detections = parse_detection_results(raw_output, frame.shape, threshold, labels)
+                        now_ts = time.monotonic()
+                        if should_process_vision_events(camera_runtime, now_ts=now_ts):
+                            event_message = handle_vision_tick(camera_runtime, detections)
+                            if event_message:
+                                if str(event_message).startswith("__INTERRUPT_AUDIO__:"):
+                                    interrupt_audio_and_speak(
+                                        camera_runtime,
+                                        str(event_message).split(":", 1)[1],
+                                    )
+                                else:
+                                    emit_vision_event_message(camera_runtime, event_message)
+                        if should_emit_vision_log(camera_runtime, now_ts=now_ts):
+                            debug_text = format_vision_debug_output(raw_output, detections)
+                            print(f"\n[vision-log] {debug_text}\n")
+                        if bool(camera_runtime.get("panel_enabled", False)):
+                            frame = annotate_frame_with_detections(frame, detections, cv2_mod)
+                except Exception as exc:
+                    print_error_red(f"ERROR: Vision inference failed: {exc}")
+                    camera_runtime["vision_enabled"] = False
+
+            speech = bool(camera_runtime.get("auto_listen_runtime", {}).get("last_is_speech", False))
+            speech_prob = float(camera_runtime.get("auto_listen_runtime", {}).get("last_speech_probability", 0.0))
+            speech_prob_threshold = float(camera_runtime.get("auto_listen_runtime", {}).get("last_speech_probability_threshold", 0.5))
+            speech_started = bool(camera_runtime.get("auto_listen_runtime", {}).get("last_speech_started", False))
+            speech_frames = int(camera_runtime.get("auto_listen_runtime", {}).get("last_speech_frames", 0))
+            start_event = float(camera_runtime.get("auto_listen_runtime", {}).get("last_start_event", 0.0))
+            end_event = float(camera_runtime.get("auto_listen_runtime", {}).get("last_end_event", 0.0))
+            recording = bool(camera_runtime.get("auto_listen_runtime", {}).get("last_recording", False))
+            display_segment_frames = int(camera_runtime.get("auto_listen_runtime", {}).get("last_display_segment_frames", 1))
+            metrics = [
+                {"label": "Speech Prob", "value": min(1.0, max(0.0, speech_prob)), "threshold": min(1.0, max(0.0, speech_prob_threshold)), "active": speech},
+                {"label": "Start Event", "value": 1.0 if start_event > 0.0 else 0.0, "threshold": 1.0, "active": start_event > 0.0},
+                {"label": "End Event", "value": 1.0 if end_event > 0.0 else 0.0, "threshold": 1.0, "active": end_event > 0.0},
+                {"label": "Segment Open", "value": 1.0 if speech_started else 0.0, "threshold": 1.0, "active": speech_started},
+                {"label": "Segment Length", "value": min(1.0, speech_frames / max(1, display_segment_frames)), "threshold": 1.0, "active": speech_started},
+                {"label": "Recording State", "value": 1.0 if recording else 0.0, "threshold": 1.0, "active": recording},
+            ]
+            gesture = ""
+            gesture_until = float(camera_runtime.get("robot_face_gesture_until", 0.0))
+            if time.monotonic() < gesture_until:
+                gesture = str(camera_runtime.get("robot_face_gesture", ""))
+            face_state = {
+                "speaking": is_audio_playback_active(),
+                "listening": speech or speech_started,
+                "gesture": gesture,
+                "visual_effects_enabled": bool(config.get("visual_effects_enabled", True)),
+            }
+            button_specs = [
+                {"label": "Camera", "action": "toggle_camera", "active": bool(config.get("camera_enabled", False))},
+                {"label": "Vision", "action": "toggle_vision", "active": bool(config.get("vision_enabled", False))},
+                {"label": "Auto Listen", "action": "toggle_auto_listen", "active": bool(config.get("auto_listen_enabled", False))},
+                {"label": "Audio", "action": "toggle_audio", "active": bool(config.get("audio_enabled", True))},
+                {"label": "Vision Events", "action": "toggle_vision_events", "active": bool(config.get("vision_event_processing_enabled", True))},
+                {"label": "Log", "action": "toggle_log", "active": bool(config.get("vision_log_enabled", False))},
+                {"label": "Audio Monitor", "action": "toggle_audio_monitor", "active": bool(config.get("audio_monitor_enabled", False))},
+                {"label": "Visual Effects", "action": "toggle_visual_effects", "active": bool(config.get("visual_effects_enabled", True))},
+                {"label": "Exit", "action": "exit_program", "active": False},
+            ]
+            if panel_enabled and window_open:
+                panel_frame, rects = build_panel_frame(
+                    np_mod,
+                    cv2_mod,
+                    frame,
+                    bool(config.get("camera_enabled", False)),
+                    opened_device_index,
+                    metrics,
+                    button_specs,
+                    bool(config.get("audio_monitor_enabled", False)),
+                    face_state,
+                )
+                camera_runtime["panel_button_rects"] = rects
+                cv2_mod.imshow(window_name, panel_frame)
+                while isinstance(action_queue, queue.Queue):
+                    try:
+                        action = action_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    handle_panel_action(str(action), camera_runtime)
+                key = cv2_mod.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
+                    camera_runtime["panel_enabled"] = False
+                    continue
+            panel_is_active = any(
+                [
+                    panel_enabled,
+                    cap is not None,
+                    bool(config.get("audio_monitor_enabled", False)),
+                    bool(config.get("vision_enabled", False)),
+                    bool(speech),
+                    bool(speech_started),
+                    bool(start_event > 0.0),
+                    bool(end_event > 0.0),
+                    bool(recording),
+                    bool(face_state.get("speaking", False)),
+                    bool(gesture),
+                ]
+            )
+            target_frame_s = 0.05 if panel_is_active else 0.25
+            remaining_s = target_frame_s - (time.monotonic() - loop_started_ts)
+            if remaining_s > 0:
+                time.sleep(remaining_s)
+    finally:
+        if cap is not None:
+            with contextlib.suppress(Exception):
+                cap.release()
+        with contextlib.suppress(Exception):
+            if window_open:
+                cv2_mod.destroyWindow(window_name)
+
+
+def start_camera_preview(camera_runtime: dict, config: dict) -> bool:
+    if not ensure_camera_worker(camera_runtime, config):
+        return False
+    camera_runtime["vision_enabled"] = bool(config.get("vision_enabled", False))
+    camera_runtime["vision_threshold"] = float(config.get("vision_threshold", 0.4))
+    camera_runtime["vision_log_enabled"] = bool(config.get("vision_log_enabled", False))
+    camera_runtime["vision_log_interval_s"] = float(config.get("vision_log_interval_s", 1.0))
+    camera_runtime["vision_log_last_ts"] = 0.0
+    camera_runtime["vision_event_processing_enabled"] = bool(config.get("vision_event_processing_enabled", True))
+    camera_runtime["vision_event_last_ts"] = 0.0
+    camera_runtime["vision_last_detection_count"] = 0
+    if camera_runtime["vision_enabled"]:
+        if not ensure_vision_runtime(camera_runtime, config):
+            return False
+    ok = set_camera_enabled(camera_runtime, config, True)
+    if ok and camera_runtime.get("thread") is not None and camera_runtime["thread"].is_alive():
+        print("Press ESC or q in the panel window to close it.\n")
+    return ok
+
+
+def handle_panel_action(action: str, camera_runtime: dict) -> None:
+    config = camera_runtime.get("voice_config")
+    if not isinstance(config, dict):
+        return
+    auto_listen_runtime = camera_runtime.get("auto_listen_runtime")
+    if action == "toggle_camera":
+        set_camera_enabled(camera_runtime, config, not bool(config.get("camera_enabled", False)))
+        return
+    if action == "toggle_vision":
+        enabled = not bool(config.get("vision_enabled", False))
+        if enabled and not ensure_vision_runtime(camera_runtime, config):
+            return
+        config["vision_enabled"] = enabled
+        camera_runtime["vision_enabled"] = enabled
+        save_robot_config(config)
+        print(f"\n✅ vision = {'on' if enabled else 'off'}\n")
+        return
+    if action == "toggle_auto_listen" and isinstance(auto_listen_runtime, dict):
+        if bool(config.get("auto_listen_enabled", False)):
+            config["auto_listen_enabled"] = False
+            save_robot_config(config)
+            stop_auto_listen(auto_listen_runtime)
+            print("\n✅ auto_listen = off\n")
+        else:
+            if start_auto_listen(auto_listen_runtime, config):
+                save_robot_config(config)
+                print("\n✅ auto_listen = on\n")
+        return
+    if action == "toggle_audio":
+        config["audio_enabled"] = not bool(config.get("audio_enabled", True))
+        save_robot_config(config)
+        print(f"\n✅ audio = {'on' if bool(config.get('audio_enabled', True)) else 'off'}\n")
+        return
+    if action == "toggle_vision_events":
+        config["vision_event_processing_enabled"] = not bool(config.get("vision_event_processing_enabled", True))
+        camera_runtime["vision_event_processing_enabled"] = bool(config["vision_event_processing_enabled"])
+        camera_runtime["vision_last_detection_count"] = 0
+        save_robot_config(config)
+        print(f"\n✅ vision_events = {'on' if bool(config['vision_event_processing_enabled']) else 'off'}\n")
+        return
+    if action == "toggle_log":
+        config["vision_log_enabled"] = not bool(config.get("vision_log_enabled", False))
+        camera_runtime["vision_log_enabled"] = bool(config["vision_log_enabled"])
+        camera_runtime["vision_log_last_ts"] = 0.0
+        if isinstance(auto_listen_runtime, dict):
+            auto_listen_runtime["vad_log_last_ts"] = 0.0
+        save_robot_config(config)
+        print(f"\n✅ vision log = {'on' if bool(config['vision_log_enabled']) else 'off'}\n")
+        return
+    if action == "toggle_audio_monitor":
+        config["audio_monitor_enabled"] = not bool(config.get("audio_monitor_enabled", False))
+        save_robot_config(config)
+        print(f"\n✅ audio_monitor = {'on' if bool(config['audio_monitor_enabled']) else 'off'}\n")
+        return
+    if action == "toggle_visual_effects":
+        config["visual_effects_enabled"] = not bool(config.get("visual_effects_enabled", True))
+        save_robot_config(config)
+        print(f"\n✅ visual_effects = {'on' if bool(config['visual_effects_enabled']) else 'off'}\n")
+        return
+    if action == "exit_program":
+        APP_EXIT_REQUESTED.set()
+        if isinstance(auto_listen_runtime, dict):
+            config["auto_listen_enabled"] = False
+            stop_auto_listen(auto_listen_runtime)
+        config["camera_enabled"] = False
+        camera_runtime["camera_enabled"] = False
+        save_robot_config(config)
+        stop_event = camera_runtime.get("stop_event")
+        if stop_event is not None:
+            stop_event.set()
+        print("\nExiting from panel...\n")
+        with contextlib.suppress(Exception):
+            _thread.interrupt_main()
+        return
+
+
 def speak_espeak_ng(text: str, config: dict, allow_interrupt: bool = False) -> tuple[bool, float]:
     exe = find_espeak_executable()
     if not exe:
@@ -1321,19 +2450,20 @@ def speak_espeak_ng(text: str, config: dict, allow_interrupt: bool = False) -> t
     proc = subprocess.Popen(cmd)
     calc_latency_s = time.perf_counter() - t_start
 
-    if not allow_interrupt:
-        proc.wait()
-        return False, calc_latency_s
+    with audio_playback_scope():
+        if not allow_interrupt:
+            proc.wait()
+            return False, calc_latency_s
 
-    with KEYBOARD.capture():
-        while proc.poll() is None:
-            if consume_esc_pressed():
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                return True, calc_latency_s
-            time.sleep(0.02)
+        with KEYBOARD.capture():
+            while proc.poll() is None:
+                if consume_esc_pressed() or is_audio_cancel_requested():
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    return True, calc_latency_s
+                time.sleep(0.02)
     return False, calc_latency_s
 
 
@@ -1760,8 +2890,82 @@ def clear_stats(stats: dict, model_number: int | None = None, device: str | None
 # =========================
 # Pipeline
 # =========================
-def load_pipeline(selected_model: dict) -> ov_genai.LLMPipeline:
+def should_probe_llm_device(device: str) -> bool:
+    dev = str(device or "").upper()
+    return IS_LINUX and "GPU" in dev
+
+
+def probe_llm_pipeline_load(model_path: Path, device: str, performance_hint: str, timeout_s: int = 45) -> tuple[bool, str]:
+    cmd = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; "
+            "import openvino_genai as ov; "
+            "ov.LLMPipeline(sys.argv[1], sys.argv[2], PERFORMANCE_HINT=sys.argv[3]); "
+            "print('OK', flush=True)"
+        ),
+        str(model_path),
+        str(device),
+        str(performance_hint),
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"probe timed out after {timeout_s}s"
+
+    if result.returncode == 0:
+        return True, ""
+
+    detail = (result.stderr or result.stdout or "").strip()
+    if not detail:
+        detail = f"probe exited with code {result.returncode}"
+    return False, detail
+
+
+def resolve_llm_device_for_load(model_path: Path, requested_device: str, allow_linux_fallback: bool = True) -> tuple[str, str | None]:
+    device = str(requested_device or "").upper()
+    if not should_probe_llm_device(device):
+        return device, None
+
+    ok, detail = probe_llm_pipeline_load(model_path, device, ACTIVE_PERFORMANCE_HINT)
+    if ok:
+        return device, None
+    if not allow_linux_fallback:
+        raise RuntimeError(f"LLM probe failed on {device}: {detail}")
+
+    print_error_red(f"ERROR: LLM probe failed on {device}: {detail}")
+    print("Falling back to CPU for this session.\n")
+
+    cpu_ok, cpu_detail = probe_llm_pipeline_load(model_path, "CPU", ACTIVE_PERFORMANCE_HINT)
+    if not cpu_ok:
+        raise RuntimeError(f"LLM probe also failed on CPU: {cpu_detail}")
+    return "CPU", detail
+
+
+def load_pipeline(selected_model: dict, allow_linux_fallback: bool = True) -> ov_genai.LLMPipeline:
+    global ACTIVE_DEVICE
     model_path = selected_model["local"]
+    requested_device = ACTIVE_DEVICE
+    actual_device, fallback_reason = resolve_llm_device_for_load(
+        model_path,
+        requested_device,
+        allow_linux_fallback=allow_linux_fallback,
+    )
+    ACTIVE_DEVICE = actual_device
+    if fallback_reason and actual_device != requested_device:
+        print_chip_fallback_warning(
+            "LLM",
+            requested_chip=requested_device,
+            actual_chip=actual_device,
+            reason=fallback_reason,
+        )
     print(
         f"\n✅ Model loaded on {ACTIVE_DEVICE}: {model_menu_label(selected_model)} "
         f"(PERFORMANCE_HINT={ACTIVE_PERFORMANCE_HINT})"
@@ -1895,6 +3099,8 @@ def activate_llm_from_config(
         return None, None, []
     current = model_from_cfg
     pipe = load_pipeline(current)
+    config["llm_device"] = ACTIVE_DEVICE
+    save_robot_config(config)
     if compat is not None:
         mark_model_device_compat(compat, current["repo"], ACTIVE_DEVICE, True)
         save_device_compat(compat)
@@ -1957,6 +3163,20 @@ Commands:
   /llm_backend <name>       Set LLM backend: local | external
   /max_tokens <n>           Set max new tokens for chat responses
   /audio <on|off>           Enable or disable speaker output
+  /audio_inputs             List available microphone/input devices
+  /audio_input_select       Select the microphone/input device for STT and auto-listen
+  /audio_monitor <on|off>   Show or hide a live audio monitor window for auto-listen input
+  /panel                    Open the control panel window
+  /camera <on|off>          Enable or disable camera preview
+  /vision <on|off>          Enable or disable OpenVINO object detection on camera frames
+  /log <on|off|seconds>     Print throttled raw vision output to the console for debugging
+  /vision_events <on|off>   Enable or disable throttled vision event processing and TTS reactions
+  /auto_listen <on|off>     Enable or disable continuous microphone VAD + automatic STT
+  /vision_models            List configured vision models
+  /vision_select            Select and download a vision model
+  /vision_model             Set the OpenVINO detection model XML path
+  /vision_labels            Set the optional labels file path
+  /vision_device <name>     Set vision device: CPU | GPU | NPU | AUTO
   /repeat <true|false>      If true, repeats input directly with TTS (no LLM)
   /listen                   Continuous listen mode (SPACE start/stop each turn)
   /tts_backend <name>       Set TTS backend: windows | parler | openvino | kokoro | babelvox | espeakng
@@ -2174,7 +3394,7 @@ def benchmark_models(
                 print(f"\n===== Benchmark model {idx} on {device}: {model_menu_label(model)} =====")
                 ACTIVE_DEVICE = device
                 try:
-                    pipe = load_pipeline(model)
+                    pipe = load_pipeline(model, allow_linux_fallback=False)
                     if compat is not None:
                         mark_model_device_compat(compat, model["repo"], device, True)
                         save_device_compat(compat)
@@ -2363,6 +3583,31 @@ def default_robot_config() -> dict:
         "external_llm_model": "",
         "external_llm_api_key": "",
         "audio_enabled": True,
+        "audio_input_device": "",
+        "audio_monitor_enabled": False,
+        "visual_effects_enabled": True,
+        "camera_enabled": False,
+        "camera_device_index": 0,
+        "vision_enabled": False,
+        "vision_model_id": "",
+        "vision_model_path": "",
+        "vision_labels_path": "",
+        "vision_device": "AUTO",
+        "vision_threshold": 0.4,
+        "vision_log_enabled": False,
+        "vision_log_interval_s": 1.0,
+        "vision_event_processing_enabled": True,
+        "auto_listen_enabled": False,
+        "auto_listen_aggressiveness": 3,
+        "auto_listen_threshold": 0.50,
+        "auto_listen_frame_ms": 32,
+        "auto_listen_preroll_ms": 350,
+        "auto_listen_min_speech_ms": 1400,
+        "auto_listen_silence_ms": 1600,
+        "auto_listen_max_segment_s": 60.0,
+        "auto_listen_resume_delay_ms": 1500,
+        "auto_listen_min_segment_ms": 1400,
+        "auto_listen_min_voiced_ratio": 0.60,
         "tts_streaming_enabled": False,
         "tts_stream_min_words": 12,
         "tts_stream_cut_on_punctuation": False,
@@ -2419,6 +3664,76 @@ def load_robot_config() -> dict:
     cfg["external_llm_base_url"] = str(cfg.get("external_llm_base_url", "http://localhost:1234")).strip() or "http://localhost:1234"
     cfg["external_llm_model"] = str(cfg.get("external_llm_model", "")).strip()
     cfg["external_llm_api_key"] = str(cfg.get("external_llm_api_key", "")).strip()
+    cfg["audio_input_device"] = str(cfg.get("audio_input_device", "")).strip()
+    cfg["audio_monitor_enabled"] = bool(cfg.get("audio_monitor_enabled", False))
+    cfg["visual_effects_enabled"] = bool(cfg.get("visual_effects_enabled", True))
+    cfg["camera_enabled"] = bool(cfg.get("camera_enabled", False))
+    try:
+        cfg["camera_device_index"] = max(0, int(cfg.get("camera_device_index", 0)))
+    except Exception:
+        cfg["camera_device_index"] = 0
+    cfg["vision_enabled"] = bool(cfg.get("vision_enabled", False))
+    cfg["vision_model_id"] = str(cfg.get("vision_model_id", "")).strip()
+    cfg["vision_model_path"] = str(cfg.get("vision_model_path", "")).strip()
+    cfg["vision_labels_path"] = str(cfg.get("vision_labels_path", "")).strip()
+    vision_device = str(cfg.get("vision_device", "AUTO")).strip().upper() or "AUTO"
+    if vision_device not in {"CPU", "GPU", "NPU", "AUTO"}:
+        vision_device = "AUTO"
+    cfg["vision_device"] = vision_device
+    try:
+        cfg["vision_threshold"] = float(cfg.get("vision_threshold", 0.4))
+    except Exception:
+        cfg["vision_threshold"] = 0.4
+    cfg["vision_threshold"] = min(1.0, max(0.0, cfg["vision_threshold"]))
+    cfg["vision_log_enabled"] = bool(cfg.get("vision_log_enabled", False))
+    try:
+        cfg["vision_log_interval_s"] = max(0.1, float(cfg.get("vision_log_interval_s", 1.0)))
+    except Exception:
+        cfg["vision_log_interval_s"] = 1.0
+    cfg["vision_event_processing_enabled"] = bool(cfg.get("vision_event_processing_enabled", True))
+    cfg["auto_listen_enabled"] = bool(cfg.get("auto_listen_enabled", False))
+    try:
+        cfg["auto_listen_aggressiveness"] = min(3, max(0, int(cfg.get("auto_listen_aggressiveness", 3))))
+    except Exception:
+        cfg["auto_listen_aggressiveness"] = 3
+    try:
+        cfg["auto_listen_threshold"] = float(cfg.get("auto_listen_threshold", 0.50))
+    except Exception:
+        cfg["auto_listen_threshold"] = 0.50
+    cfg["auto_listen_threshold"] = min(0.99, max(0.01, cfg["auto_listen_threshold"]))
+    try:
+        frame_ms = int(cfg.get("auto_listen_frame_ms", 32))
+    except Exception:
+        frame_ms = 32
+    cfg["auto_listen_frame_ms"] = frame_ms if frame_ms in {32, 64, 96} else 32
+    try:
+        cfg["auto_listen_preroll_ms"] = max(0, int(cfg.get("auto_listen_preroll_ms", 300)))
+    except Exception:
+        cfg["auto_listen_preroll_ms"] = 300
+    try:
+        cfg["auto_listen_min_speech_ms"] = max(30, int(cfg.get("auto_listen_min_speech_ms", 1400)))
+    except Exception:
+        cfg["auto_listen_min_speech_ms"] = 1400
+    try:
+        cfg["auto_listen_silence_ms"] = max(100, int(cfg.get("auto_listen_silence_ms", 900)))
+    except Exception:
+        cfg["auto_listen_silence_ms"] = 900
+    try:
+        cfg["auto_listen_max_segment_s"] = max(1.0, float(cfg.get("auto_listen_max_segment_s", 15.0)))
+    except Exception:
+        cfg["auto_listen_max_segment_s"] = 15.0
+    try:
+        cfg["auto_listen_resume_delay_ms"] = max(0, int(cfg.get("auto_listen_resume_delay_ms", 1500)))
+    except Exception:
+        cfg["auto_listen_resume_delay_ms"] = 1500
+    try:
+        cfg["auto_listen_min_segment_ms"] = max(100, int(cfg.get("auto_listen_min_segment_ms", 1400)))
+    except Exception:
+        cfg["auto_listen_min_segment_ms"] = 1400
+    try:
+        cfg["auto_listen_min_voiced_ratio"] = min(1.0, max(0.0, float(cfg.get("auto_listen_min_voiced_ratio", 0.60))))
+    except Exception:
+        cfg["auto_listen_min_voiced_ratio"] = 0.60
     cfg["tts_streaming_enabled"] = bool(cfg.get("tts_streaming_enabled", False))
     try:
         cfg["tts_stream_min_words"] = int(cfg.get("tts_stream_min_words", 12))
@@ -2564,21 +3879,22 @@ def speak_text(speaker, text: str, config: dict, allow_interrupt: bool = False) 
     speak_flags_async_xml = 1 | 8
     purge_flags = 1 | 2
     t_start = time.perf_counter()
-    speaker.Speak(xml, speak_flags_async_xml)
-    calc_latency_s = time.perf_counter() - t_start
-    if use_warmup and not bool(config.get("_tts_warmup_done", False)):
-        config["_tts_warmup_done"] = True
+    with audio_playback_scope():
+        speaker.Speak(xml, speak_flags_async_xml)
+        calc_latency_s = time.perf_counter() - t_start
+        if use_warmup and not bool(config.get("_tts_warmup_done", False)):
+            config["_tts_warmup_done"] = True
 
-    if not allow_interrupt:
-        while not speaker.WaitUntilDone(50):
-            pass
-        return False, calc_latency_s
+        if not allow_interrupt:
+            while not speaker.WaitUntilDone(50):
+                pass
+            return False, calc_latency_s
 
-    with KEYBOARD.capture():
-        while not speaker.WaitUntilDone(50):
-            if consume_esc_pressed():
-                speaker.Speak("", purge_flags)
-                return True, calc_latency_s
+        with KEYBOARD.capture():
+            while not speaker.WaitUntilDone(50):
+                if consume_esc_pressed() or is_audio_cancel_requested():
+                    speaker.Speak("", purge_flags)
+                    return True, calc_latency_s
     return False, calc_latency_s
 
 
@@ -3036,179 +4352,172 @@ def speak_text_backend(
     tts_runtime: dict,
     allow_interrupt: bool = False,
 ) -> tuple[bool, float]:
-    backend = normalize_tts_backend_for_platform(
-        config.get("tts_backend", DEFAULT_TTS_BACKEND),
-        PLATFORM_NAME,
-    )
-    if backend == "windows":
-        if speaker is None:
-            print_error_red("ERROR: Windows TTS backend selected but SAPI voice engine is unavailable.")
+    with tts_activity_scope():
+        backend = normalize_tts_backend_for_platform(
+            config.get("tts_backend", DEFAULT_TTS_BACKEND),
+            PLATFORM_NAME,
+        )
+        if backend == "windows":
+            if speaker is None:
+                print_error_red("ERROR: Windows TTS backend selected but SAPI voice engine is unavailable.")
+                return False, 0.0
+            return speak_text(speaker, text, config, allow_interrupt=allow_interrupt)
+        if backend == "espeakng":
+            return speak_espeak_ng(text, config, allow_interrupt=allow_interrupt)
+        if not ensure_tts_runtime(tts_runtime, config):
             return False, 0.0
-        return speak_text(speaker, text, config, allow_interrupt=allow_interrupt)
-    if backend == "espeakng":
-        return speak_espeak_ng(text, config, allow_interrupt=allow_interrupt)
-
-    if not ensure_tts_runtime(tts_runtime, config):
-        return False, 0.0
-
-    try:
-        t_start = time.perf_counter()
-        np_mod = tts_runtime["numpy"]
-        sd_mod = tts_runtime["sounddevice"]
-
-        if backend == "parler":
-            voice_prompt = build_parler_description(config)
-            tokenizer = tts_runtime["parler_tokenizer"]
-            model = tts_runtime["parler_model"]
-            torch_mod = tts_runtime["torch"]
-            description_ids = tokenizer(
-                voice_prompt or "Use the language that best matches the input text. Use a neutral speaking style.",
-                return_tensors="pt",
-            ).input_ids
-            prompt_ids = tokenizer(text, return_tensors="pt").input_ids
-            with torch_mod.no_grad():
-                audio_tensor = model.generate(input_ids=description_ids, prompt_input_ids=prompt_ids)
-            calc_latency_s = time.perf_counter() - t_start
-            audio = audio_tensor.cpu().numpy().squeeze().astype(np_mod.float32)
-            sample_rate = int(getattr(model.config, "sampling_rate", config.get("parler_sample_rate", 24000)))
-        elif backend == "openvino":
-            timeout_s = int(config.get("openvino_tts_timeout_s", 25))
-            device = str(config.get("openvino_tts_device", "AUTO")).strip().upper()
-            isolated_gpu = bool(config.get("openvino_tts_isolated_gpu", True))
-            use_isolated = isolated_gpu and device == "GPU"
-            if use_isolated:
-                model_dir = str(tts_runtime.get("ov_model_dir") or "")
-                if not model_dir:
-                    raise RuntimeError("OpenVINO TTS model directory is unavailable.")
-                ctx = mp.get_context("spawn")
-                result_queue = ctx.Queue(maxsize=1)
-                proc = ctx.Process(
-                    target=_openvino_tts_worker,
-                    args=(model_dir, device, text, result_queue),
-                    daemon=True,
-                )
-                proc.start()
-                proc.join(timeout=timeout_s)
-                if proc.is_alive():
-                    proc.terminate()
-                    proc.join(timeout=2)
-                    print_error_red(
-                        f"ERROR: OpenVINO TTS generation timed out after {timeout_s}s on device {device}."
-                    )
-                    print_error_red("ERROR: Worker process was terminated to avoid CPU lock.")
-                    print_error_red("ERROR: Suggestion: switch OpenVINO TTS device to CPU.")
-                    return False, time.perf_counter() - t_start
-                payload = None
-                if not result_queue.empty():
-                    payload = result_queue.get_nowait()
-                if not payload:
-                    raise RuntimeError("OpenVINO TTS worker returned no data.")
-                if not payload.get("ok"):
-                    raise RuntimeError(str(payload.get("error", "unknown OpenVINO TTS worker error")))
+        try:
+            t_start = time.perf_counter()
+            np_mod = tts_runtime["numpy"]
+            sd_mod = tts_runtime["sounddevice"]
+            if backend == "parler":
+                voice_prompt = build_parler_description(config)
+                tokenizer = tts_runtime["parler_tokenizer"]
+                model = tts_runtime["parler_model"]
+                torch_mod = tts_runtime["torch"]
+                description_ids = tokenizer(
+                    voice_prompt or "Use the language that best matches the input text. Use a neutral speaking style.",
+                    return_tensors="pt",
+                ).input_ids
+                prompt_ids = tokenizer(text, return_tensors="pt").input_ids
+                with torch_mod.no_grad():
+                    audio_tensor = model.generate(input_ids=description_ids, prompt_input_ids=prompt_ids)
                 calc_latency_s = time.perf_counter() - t_start
-                audio = np_mod.array(payload.get("audio", []), dtype=np_mod.float32).reshape(-1)
-            else:
-                result_box = {"result": None, "error": None}
-
-                def _ov_generate():
-                    try:
-                        result_box["result"] = tts_runtime["pipeline"].generate(text)
-                    except Exception as exc:
-                        result_box["error"] = exc
-
-                worker = threading.Thread(target=_ov_generate, daemon=True)
-                worker.start()
-                worker.join(timeout=timeout_s)
-                if worker.is_alive():
-                    print_error_red(
-                        f"ERROR: OpenVINO TTS generation timed out after {timeout_s}s on "
-                        f"device {config.get('openvino_tts_device', 'AUTO')}."
+                audio = audio_tensor.cpu().numpy().squeeze().astype(np_mod.float32)
+                sample_rate = int(getattr(model.config, "sampling_rate", config.get("parler_sample_rate", 24000)))
+            elif backend == "openvino":
+                timeout_s = int(config.get("openvino_tts_timeout_s", 25))
+                device = str(config.get("openvino_tts_device", "AUTO")).strip().upper()
+                isolated_gpu = bool(config.get("openvino_tts_isolated_gpu", True))
+                use_isolated = isolated_gpu and device == "GPU"
+                if use_isolated:
+                    model_dir = str(tts_runtime.get("ov_model_dir") or "")
+                    if not model_dir:
+                        raise RuntimeError("OpenVINO TTS model directory is unavailable.")
+                    ctx = mp.get_context("spawn")
+                    result_queue = ctx.Queue(maxsize=1)
+                    proc = ctx.Process(
+                        target=_openvino_tts_worker,
+                        args=(model_dir, device, text, result_queue),
+                        daemon=True,
                     )
-                    print_error_red("ERROR: Suggestion: switch OpenVINO TTS device to CPU.")
-                    tts_runtime["pipeline"] = None
-                    tts_runtime["active_key"] = None
-                    tts_runtime["backend"] = None
-                    return False, time.perf_counter() - t_start
-                if result_box["error"] is not None:
-                    raise result_box["error"]
-
-                result = result_box["result"]
-                calc_latency_s = time.perf_counter() - t_start
-                speeches = getattr(result, "speeches", None)
-                if not speeches:
-                    print_error_red("ERROR: openvino TTS returned no audio.")
-                    return False, calc_latency_s
-                audio_obj = speeches[0]
-                if hasattr(audio_obj, "data"):
-                    audio = np_mod.array(audio_obj.data, dtype=np_mod.float32).reshape(-1)
+                    proc.start()
+                    proc.join(timeout=timeout_s)
+                    if proc.is_alive():
+                        proc.terminate()
+                        proc.join(timeout=2)
+                        print_error_red(
+                            f"ERROR: OpenVINO TTS generation timed out after {timeout_s}s on device {device}."
+                        )
+                        print_error_red("ERROR: Worker process was terminated to avoid CPU lock.")
+                        print_error_red("ERROR: Suggestion: switch OpenVINO TTS device to CPU.")
+                        return False, time.perf_counter() - t_start
+                    payload = result_queue.get_nowait() if not result_queue.empty() else None
+                    if not payload:
+                        raise RuntimeError("OpenVINO TTS worker returned no data.")
+                    if not payload.get("ok"):
+                        raise RuntimeError(str(payload.get("error", "unknown OpenVINO TTS worker error")))
+                    calc_latency_s = time.perf_counter() - t_start
+                    audio = np_mod.array(payload.get("audio", []), dtype=np_mod.float32).reshape(-1)
                 else:
-                    audio = np_mod.array(audio_obj, dtype=np_mod.float32).reshape(-1)
-            sample_rate = int(config.get("parler_sample_rate", 24000))
-            audio = apply_openvino_tts_postprocess(audio, np_mod, config)
-        elif backend == "kokoro":
-            engine = tts_runtime.get("kokoro_engine")
-            if engine is None:
-                raise RuntimeError("Kokoro engine not initialized.")
-            voice = str(config.get("kokoro_voice", "af_sarah")).strip() or "af_sarah"
-            lang_code = str(config.get("babelvox_language", "en")).strip().lower()
-            kokoro_lang = {
-                "es": "es",
-                "en": "en-us",
-                "pt": "pt-br",
-                "fr": "fr-fr",
-                "it": "it",
-                "de": "de",
-            }.get(lang_code, "en-us")
-            output = engine.create(text, voice=voice, speed=1.0, lang=kokoro_lang)
-            calc_latency_s = time.perf_counter() - t_start
-            sample_rate = int(config.get("parler_sample_rate", 24000))
-            if isinstance(output, tuple) and len(output) >= 2:
-                audio_raw = output[0]
-                try:
-                    sample_rate = int(output[1])
-                except Exception:
-                    pass
-            elif isinstance(output, dict):
-                audio_raw = output.get("audio") or output.get("wav") or output.get("samples")
-                if output.get("sample_rate") is not None:
-                    sample_rate = int(output["sample_rate"])
+                    result_box = {"result": None, "error": None}
+
+                    def _ov_generate():
+                        try:
+                            result_box["result"] = tts_runtime["pipeline"].generate(text)
+                        except Exception as exc:
+                            result_box["error"] = exc
+
+                    worker = threading.Thread(target=_ov_generate, daemon=True)
+                    worker.start()
+                    worker.join(timeout=timeout_s)
+                    if worker.is_alive():
+                        print_error_red(
+                            f"ERROR: OpenVINO TTS generation timed out after {timeout_s}s on "
+                            f"device {config.get('openvino_tts_device', 'AUTO')}."
+                        )
+                        print_error_red("ERROR: Suggestion: switch OpenVINO TTS device to CPU.")
+                        tts_runtime["pipeline"] = None
+                        tts_runtime["active_key"] = None
+                        tts_runtime["backend"] = None
+                        return False, time.perf_counter() - t_start
+                    if result_box["error"] is not None:
+                        raise result_box["error"]
+                    result = result_box["result"]
+                    calc_latency_s = time.perf_counter() - t_start
+                    speeches = getattr(result, "speeches", None)
+                    if not speeches:
+                        print_error_red("ERROR: openvino TTS returned no audio.")
+                        return False, calc_latency_s
+                    audio_obj = speeches[0]
+                    if hasattr(audio_obj, "data"):
+                        audio = np_mod.array(audio_obj.data, dtype=np_mod.float32).reshape(-1)
+                    else:
+                        audio = np_mod.array(audio_obj, dtype=np_mod.float32).reshape(-1)
+                sample_rate = int(config.get("parler_sample_rate", 24000))
+                audio = apply_openvino_tts_postprocess(audio, np_mod, config)
+            elif backend == "kokoro":
+                engine = tts_runtime.get("kokoro_engine")
+                if engine is None:
+                    raise RuntimeError("Kokoro engine not initialized.")
+                voice = str(config.get("kokoro_voice", "af_sarah")).strip() or "af_sarah"
+                lang_code = str(config.get("babelvox_language", "en")).strip().lower()
+                kokoro_lang = {
+                    "es": "es",
+                    "en": "en-us",
+                    "pt": "pt-br",
+                    "fr": "fr-fr",
+                    "it": "it",
+                    "de": "de",
+                }.get(lang_code, "en-us")
+                output = engine.create(text, voice=voice, speed=1.0, lang=kokoro_lang)
+                calc_latency_s = time.perf_counter() - t_start
+                sample_rate = int(config.get("parler_sample_rate", 24000))
+                if isinstance(output, tuple) and len(output) >= 2:
+                    audio_raw = output[0]
+                    try:
+                        sample_rate = int(output[1])
+                    except Exception:
+                        pass
+                elif isinstance(output, dict):
+                    audio_raw = output.get("audio") or output.get("wav") or output.get("samples")
+                    if output.get("sample_rate") is not None:
+                        sample_rate = int(output["sample_rate"])
+                else:
+                    audio_raw = output
+                audio = np_mod.array(audio_raw, dtype=np_mod.float32).reshape(-1)
+            elif backend == "babelvox":
+                engine = tts_runtime.get("babelvox_engine")
+                if engine is None:
+                    raise RuntimeError("BabelVox engine not initialized.")
+                lang_code = str(config.get("babelvox_language", "es")).strip().lower()
+                language = BABELVOX_LANGUAGE_MAP.get(lang_code, "English")
+                wav, sample_rate = engine.generate(text, language=language)
+                calc_latency_s = time.perf_counter() - t_start
+                audio = np_mod.array(wav, dtype=np_mod.float32).reshape(-1)
             else:
-                audio_raw = output
-            audio = np_mod.array(audio_raw, dtype=np_mod.float32).reshape(-1)
-        elif backend == "babelvox":
-            engine = tts_runtime.get("babelvox_engine")
-            if engine is None:
-                raise RuntimeError("BabelVox engine not initialized.")
-            lang_code = str(config.get("babelvox_language", "es")).strip().lower()
-            language = BABELVOX_LANGUAGE_MAP.get(lang_code, "English")
-            wav, sample_rate = engine.generate(text, language=language)
-            calc_latency_s = time.perf_counter() - t_start
-            audio = np_mod.array(wav, dtype=np_mod.float32).reshape(-1)
-        else:
-            print_error_red(f"ERROR: Unsupported TTS backend: {backend}")
+                print_error_red(f"ERROR: Unsupported TTS backend: {backend}")
+                return False, 0.0
+            if getattr(audio, "size", 0) == 0:
+                print_error_red(f"ERROR: {backend} returned an empty audio buffer.")
+                return False, calc_latency_s
+            with audio_playback_scope():
+                sd_mod.play(audio, samplerate=sample_rate)
+                if not allow_interrupt:
+                    sd_mod.wait()
+                    return False, calc_latency_s
+                while True:
+                    if consume_esc_pressed() or is_audio_cancel_requested():
+                        sd_mod.stop()
+                        return True, calc_latency_s
+                    stream = sd_mod.get_stream()
+                    if stream is None or not stream.active:
+                        break
+                    time.sleep(0.02)
+                return False, calc_latency_s
+        except Exception as exc:
+            print_error_red(f"ERROR: {backend} synthesis failed: {exc}")
             return False, 0.0
-
-        if getattr(audio, "size", 0) == 0:
-            print_error_red(f"ERROR: {backend} returned an empty audio buffer.")
-            return False, calc_latency_s
-
-        sd_mod.play(audio, samplerate=sample_rate)
-        if not allow_interrupt:
-            sd_mod.wait()
-            return False, calc_latency_s
-
-        while True:
-            if consume_esc_pressed():
-                sd_mod.stop()
-                return True, calc_latency_s
-            stream = sd_mod.get_stream()
-            if stream is None or not stream.active:
-                break
-            time.sleep(0.02)
-        return False, calc_latency_s
-    except Exception as exc:
-        print_error_red(f"ERROR: {backend} synthesis failed: {exc}")
-        return False, 0.0
 
 
 def choose_voice_interactive(speaker, voices, config: dict) -> None:
@@ -3288,6 +4597,81 @@ def clear_keyboard_buffer() -> None:
     KEYBOARD.clear_buffer()
 
 
+def set_tts_activity(active: bool) -> None:
+    global TTS_ACTIVITY_COUNT, LAST_TTS_ACTIVITY_END_TS
+    with TTS_ACTIVITY_LOCK:
+        if active:
+            TTS_ACTIVITY_COUNT += 1
+        else:
+            TTS_ACTIVITY_COUNT = max(0, TTS_ACTIVITY_COUNT - 1)
+        if TTS_ACTIVITY_COUNT > 0:
+            TTS_PLAYING_EVENT.set()
+        else:
+            TTS_PLAYING_EVENT.clear()
+            LAST_TTS_ACTIVITY_END_TS = time.monotonic()
+
+
+def is_tts_active() -> bool:
+    return TTS_PLAYING_EVENT.is_set()
+
+
+def set_audio_playback_activity(active: bool) -> None:
+    global PLAYBACK_ACTIVITY_COUNT
+    with PLAYBACK_ACTIVITY_LOCK:
+        if active:
+            PLAYBACK_ACTIVITY_COUNT += 1
+        else:
+            PLAYBACK_ACTIVITY_COUNT = max(0, PLAYBACK_ACTIVITY_COUNT - 1)
+        if PLAYBACK_ACTIVITY_COUNT > 0:
+            AUDIO_PLAYBACK_EVENT.set()
+        else:
+            AUDIO_PLAYBACK_EVENT.clear()
+
+
+@contextlib.contextmanager
+def audio_playback_scope():
+    set_audio_playback_activity(True)
+    try:
+        yield
+    finally:
+        set_audio_playback_activity(False)
+
+
+def is_audio_playback_active() -> bool:
+    return AUDIO_PLAYBACK_EVENT.is_set()
+
+
+def request_audio_cancel() -> None:
+    AUDIO_CANCEL_EVENT.set()
+
+
+def clear_audio_cancel() -> None:
+    AUDIO_CANCEL_EVENT.clear()
+
+
+def is_audio_cancel_requested() -> bool:
+    return AUDIO_CANCEL_EVENT.is_set()
+
+
+def is_tts_blocking_auto_listen(config: dict | None = None) -> bool:
+    if is_tts_active():
+        return True
+    cfg = config if isinstance(config, dict) else {}
+    cooldown_ms = max(0, int(cfg.get("auto_listen_resume_delay_ms", 1500)))
+    if cooldown_ms <= 0:
+        return False
+    return (time.monotonic() - LAST_TTS_ACTIVITY_END_TS) < (cooldown_ms / 1000.0)
+
+
+@contextlib.contextmanager
+def tts_activity_scope():
+    set_tts_activity(True)
+    try:
+        yield
+    finally:
+        set_tts_activity(False)
+
+
 def consume_esc_pressed() -> bool:
     esc = False
     while True:
@@ -3299,7 +4683,7 @@ def consume_esc_pressed() -> bool:
     return esc
 
 
-def record_until_space(sd_mod, np_mod, sample_rate: int = 16000, channels: int = 1, blocksize: int = 1024):
+def record_until_space(sd_mod, np_mod, sample_rate: int = 16000, channels: int = 1, blocksize: int = 1024, device=None):
     frames = []
     stop_ts = time.perf_counter()
 
@@ -3316,6 +4700,7 @@ def record_until_space(sd_mod, np_mod, sample_rate: int = 16000, channels: int =
             channels=channels,
             dtype="float32",
             blocksize=blocksize,
+            device=device,
             callback=callback,
         ):
             while True:
@@ -3349,6 +4734,133 @@ def whisper_model_size_info(whisper_mod, model_name: str) -> tuple[bool, str]:
     if expected is not None:
         return False, f"~{human_bytes(expected)}"
     return False, "unknown"
+
+
+def resolve_audio_input_device(config: dict, sd_mod):
+    raw = str(config.get("audio_input_device", "")).strip()
+    if not raw:
+        return None
+    try:
+        if raw.lstrip("-").isdigit():
+            return int(raw)
+    except Exception:
+        pass
+    try:
+        devices = sd_mod.query_devices()
+    except Exception:
+        return raw
+    for idx, dev in enumerate(devices):
+        try:
+            if int(dev.get("max_input_channels", 0)) <= 0:
+                continue
+            if str(dev.get("name", "")).strip() == raw:
+                return idx
+        except Exception:
+            continue
+    return raw
+
+
+def _normalized_audio_device_name(name: str) -> str:
+    text = " ".join(str(name or "").replace("\r", " ").replace("\n", " ").split())
+    return text.strip()
+
+
+def list_audio_input_devices(sd_mod) -> list[tuple[int, str, int]]:
+    devices = []
+    hostapi_names: dict[int, str] = {}
+    with contextlib.suppress(Exception):
+        for idx, hostapi in enumerate(sd_mod.query_hostapis()):
+            hostapi_names[idx] = str(hostapi.get("name", "")).strip()
+    preferred_hostapis = ["Windows WASAPI", "WASAPI", "Windows DirectSound", "DirectSound", "MME"]
+    generic_names = {
+        "microsoft sound mapper - input",
+        "asignador de sonido microsoft - input",
+        "primary sound capture driver",
+        "controlador primario de captura de sonido",
+    }
+    by_name: dict[str, tuple[int, str, int, int]] = {}
+    for idx, dev in enumerate(sd_mod.query_devices()):
+        try:
+            max_in = int(dev.get("max_input_channels", 0))
+        except Exception:
+            max_in = 0
+        if max_in <= 0:
+            continue
+        raw_name = _normalized_audio_device_name(dev.get("name", f"Input {idx}")) or f"Input {idx}"
+        if raw_name.lower() in generic_names:
+            continue
+        hostapi_index = int(dev.get("hostapi", -1))
+        hostapi_name = hostapi_names.get(hostapi_index, "")
+        priority = preferred_hostapis.index(hostapi_name) if hostapi_name in preferred_hostapis else len(preferred_hostapis)
+        key = raw_name.lower()
+        current = by_name.get(key)
+        candidate = (priority, raw_name, max_in, idx)
+        if current is None or candidate[0] < current[0]:
+            by_name[key] = candidate
+    for _priority, name, max_in, idx in sorted(by_name.values(), key=lambda item: item[1].lower()):
+        devices.append((idx, name, max_in))
+    return devices
+
+
+def build_audio_monitor_frame(
+    np_mod,
+    level: float,
+    threshold: float,
+    speech_detected: bool,
+    width: int = 420,
+    height: int = 250,
+    metrics: list[dict] | None = None,
+):
+    frame = np_mod.zeros((height, width, 3), dtype=np_mod.uint8)
+    frame[:, :] = (18, 18, 18)
+    bar_x = 24
+    bar_w = width - 48
+    bar_h = 18
+    if metrics is None:
+        metrics = [{"label": "Speech Prob", "value": level, "threshold": threshold, "active": speech_detected}]
+    for idx, metric in enumerate(metrics):
+        value = max(0.0, min(1.0, float(metric.get("value", 0.0))))
+        metric_threshold = max(0.0, min(1.0, float(metric.get("threshold", 1.0))))
+        active = bool(metric.get("active", False))
+        bar_y = 44 + idx * 42
+        fill_w = int(bar_w * value)
+        threshold_x = bar_x + int(bar_w * metric_threshold)
+        color = (0, 200, 0) if active else (0, 170, 255)
+        frame[bar_y:bar_y + bar_h, bar_x:bar_x + bar_w] = (45, 45, 45)
+        if fill_w > 0:
+            frame[bar_y:bar_y + bar_h, bar_x:bar_x + fill_w] = color
+        frame[bar_y - 6:bar_y + bar_h + 6, max(bar_x, threshold_x - 1):min(width, threshold_x + 1)] = (0, 0, 255)
+        indicator_cx = width - 16
+        indicator_cy = bar_y + (bar_h // 2)
+        radius = 6
+        yy, xx = np_mod.ogrid[:height, :width]
+        mask = (xx - indicator_cx) ** 2 + (yy - indicator_cy) ** 2 <= radius ** 2
+        frame[mask] = (0, 190, 0) if active else (70, 70, 70)
+    return frame
+
+
+def choose_audio_input_device_interactive(sd_mod, current_value: str = "") -> tuple[str, str] | None:
+    devices = list_audio_input_devices(sd_mod)
+    if not devices:
+        print("\nNo audio input devices were detected.\n")
+        return None
+    print("\nAudio input devices:\n")
+    current = str(current_value or "").strip()
+    for number, (idx, name, channels) in enumerate(devices, 1):
+        marker = ""
+        if current and (current == str(idx) or current == name):
+            marker = " (current)"
+        print(f"  {number}) {name} [index={idx}, channels={channels}]{marker}")
+    print("")
+    while True:
+        value = input("Choose input device number (or 'cancel'): ").strip().lower()
+        if value == "cancel":
+            return None
+        if not value.isdigit() or not (1 <= int(value) <= len(devices)):
+            print("Invalid option.")
+            continue
+        idx, name, _channels = devices[int(value) - 1]
+        return str(idx), name
 
 
 def is_whisper_classic_downloaded(model_name: str) -> bool:
@@ -3530,10 +5042,20 @@ def transcribe_from_mic(stt_runtime: dict, config: dict) -> tuple[str, float]:
     if not ensure_stt_runtime(stt_runtime, config):
         return "", 0.0
     np_mod = stt_runtime["numpy"]
-    audio, speech_end_ts = record_until_space(stt_runtime["sounddevice"], np_mod)
+    device = resolve_audio_input_device(config, stt_runtime["sounddevice"])
+    audio, speech_end_ts = record_until_space(stt_runtime["sounddevice"], np_mod, device=device)
     if getattr(audio, "size", 0) == 0:
         print("\n⚠️ No audio captured.\n")
         return "", 0.0
+    return transcribe_audio_buffer(stt_runtime, config, audio, speech_end_ts)
+
+
+def transcribe_audio_buffer(stt_runtime: dict, config: dict, audio, speech_end_ts: float | None = None) -> tuple[str, float]:
+    if not ensure_stt_runtime(stt_runtime, config):
+        return "", 0.0
+    if getattr(audio, "size", 0) == 0:
+        return "", 0.0
+    speech_end_ts = speech_end_ts if speech_end_ts is not None else time.perf_counter()
     is_ov = stt_runtime.get("backend") == "ov"
     whisper_language = str(config.get("whisper_language", "es")).strip().lower()
     if whisper_language not in WHISPER_LANGUAGE_OPTIONS:
@@ -3576,6 +5098,488 @@ def transcribe_from_mic(stt_runtime: dict, config: dict) -> tuple[str, float]:
         return "", speech_end_to_text_s
     print(f"You said: {text}\n")
     return text, speech_end_to_text_s
+
+
+def process_auto_listen_text(
+    text: str,
+    llm_state: dict,
+    stats: dict,
+    speaker,
+    voice_config: dict,
+    stt_runtime: dict,
+    tts_runtime: dict,
+) -> None:
+    user_text = str(text or "").strip()
+    if not user_text:
+        return
+    print(f"[auto-listen] {user_text}\n")
+    if bool(voice_config.get("repeat", False)):
+        if bool(voice_config.get("audio_enabled", True)):
+            speak_text_backend(
+                speaker,
+                user_text,
+                voice_config,
+                tts_runtime,
+                allow_interrupt=True,
+            )
+        return
+    run_chat_turn(
+        user_text,
+        llm_state.get("pipe"),
+        llm_state.get("current"),
+        llm_state.get("history", []),
+        stats,
+        speaker,
+        voice_config,
+        tts_runtime,
+    )
+
+
+def is_valid_auto_listen_transcript(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    words = [w for w in re.split(r"\s+", normalized) if w]
+    if not words:
+        return False
+    if len(words) >= 4:
+        return True
+    return "hola" in words
+
+
+def _reset_vad_segment_state(state: dict) -> None:
+    state["pre_roll"] = []
+    state["speech_frames"] = []
+    state["speech_started"] = False
+    state["trigger_window"] = []
+    state["endpoint_window"] = []
+
+
+def ms_to_frame_count(duration_ms: int, frame_ms: int, minimum: int = 1) -> int:
+    if frame_ms <= 0:
+        return max(minimum, 1)
+    return max(minimum, int((max(0, int(duration_ms)) + frame_ms - 1) // frame_ms))
+
+
+def _finalize_vad_segment(np_mod, state: dict):
+    speech_frames = list(state.get("speech_frames", []))
+    if not speech_frames:
+        _reset_vad_segment_state(state)
+        return None, "empty"
+    frame_ms = int(state.get("frame_ms", 30))
+    min_segment_ms = int(state.get("min_segment_ms", 1400))
+    if len(speech_frames) * frame_ms < min_segment_ms:
+        _reset_vad_segment_state(state)
+        return None, f"segment_too_short:{len(speech_frames) * frame_ms}ms"
+    audio_i16 = np_mod.frombuffer(b"".join(speech_frames), dtype=np_mod.int16)
+    audio = audio_i16.astype(np_mod.float32) / 32768.0
+    _reset_vad_segment_state(state)
+    return audio.reshape(-1), ""
+
+
+def prepare_auto_listen_runtime(auto_listen_runtime: dict, config: dict) -> bool:
+    stt_runtime = auto_listen_runtime["stt_runtime"]
+    np_mod = stt_runtime.get("numpy") or ensure_dependency("numpy", "numpy", "NumPy")
+    if np_mod is None:
+        return False
+    stt_runtime["numpy"] = np_mod
+
+    sd_mod = stt_runtime.get("sounddevice") or ensure_dependency("sounddevice", "sounddevice", "SoundDevice")
+    if sd_mod is None:
+        return False
+    stt_runtime["sounddevice"] = sd_mod
+
+    silero_mod = auto_listen_runtime.get("silero_vad") or ensure_dependency("silero_vad", "silero-vad", "Silero VAD")
+    if silero_mod is None:
+        return False
+    auto_listen_runtime["silero_vad"] = silero_mod
+
+    torch_mod = stt_runtime.get("torch") or ensure_dependency("torch", "torch", "PyTorch")
+    if torch_mod is None:
+        return False
+    stt_runtime["torch"] = torch_mod
+
+    model = auto_listen_runtime.get("silero_model")
+    if model is None:
+        load_model = getattr(silero_mod, "load_silero_vad", None)
+        if load_model is None:
+            print_error_red("ERROR: Silero VAD package does not expose load_silero_vad().")
+            return False
+        try:
+            model = load_model()
+        except TypeError:
+            model = load_model(onnx=True)
+        except Exception as exc:
+            print_error_red(f"ERROR: Failed to initialize Silero VAD: {exc}")
+            return False
+        auto_listen_runtime["silero_model"] = model
+
+    vad_iterator_cls = auto_listen_runtime.get("silero_vad_iterator_cls")
+    if vad_iterator_cls is None:
+        vad_iterator_cls = getattr(silero_mod, "VADIterator", None)
+        if vad_iterator_cls is None:
+            print_error_red("ERROR: Silero VAD package does not expose VADIterator.")
+            return False
+        auto_listen_runtime["silero_vad_iterator_cls"] = vad_iterator_cls
+
+    with contextlib.suppress(Exception):
+        model.reset_states()
+
+    try:
+        input_device = None
+        with contextlib.suppress(Exception):
+            input_device = sd_mod.query_devices(kind="input")
+        selected_device = resolve_audio_input_device(config, sd_mod)
+        sd_mod.check_input_settings(device=selected_device, samplerate=16000, channels=1, dtype="int16")
+        if isinstance(input_device, dict):
+            name = str(input_device.get("name", "(default input)"))
+            if selected_device is None:
+                print(f"\n🎙️ Auto-listen input device: {name}\n")
+        if selected_device is not None:
+            selected_name = str(config.get("audio_input_device", "")).strip() or str(selected_device)
+            print(f"\n🎙️ Auto-listen input device: {selected_name}\n")
+        return True
+    except Exception as exc:
+        print_error_red(f"ERROR: Auto-listen microphone is unavailable: {exc}")
+        if IS_WINDOWS:
+            print("Open Windows Settings > Privacy & security > Microphone and allow desktop apps to access the microphone.\n")
+        else:
+            print("Check the default input device and OS microphone permissions.\n")
+        return False
+
+
+def stop_audio_monitor(auto_listen_runtime: dict) -> None:
+    camera_runtime = auto_listen_runtime.get("camera_runtime")
+    if isinstance(camera_runtime, dict):
+        return
+    stop_event = auto_listen_runtime.get("audio_monitor_stop_event")
+    thread = auto_listen_runtime.get("audio_monitor_thread")
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2)
+    auto_listen_runtime["audio_monitor_thread"] = None
+    auto_listen_runtime["audio_monitor_stop_event"] = None
+
+
+def _audio_monitor_worker(auto_listen_runtime: dict) -> None:
+    try:
+        cv2_mod = auto_listen_runtime.get("cv2")
+        if cv2_mod is None:
+            cv2_mod = ensure_dependency("cv2", "opencv-python", "OpenCV")
+            if cv2_mod is None:
+                return
+            auto_listen_runtime["cv2"] = cv2_mod
+        np_mod = auto_listen_runtime["stt_runtime"].get("numpy") or ensure_dependency("numpy", "numpy", "NumPy")
+        if np_mod is None:
+            return
+        stop_event = auto_listen_runtime.get("audio_monitor_stop_event")
+        if stop_event is None:
+            return
+        window_name = "Robot Audio Monitor"
+        while not stop_event.is_set():
+            speech = bool(auto_listen_runtime.get("last_is_speech", False))
+            speech_prob = float(auto_listen_runtime.get("last_speech_probability", 0.0))
+            speech_prob_threshold = float(auto_listen_runtime.get("last_speech_probability_threshold", 0.5))
+            speech_started = bool(auto_listen_runtime.get("last_speech_started", False))
+            speech_frames = int(auto_listen_runtime.get("last_speech_frames", 0))
+            recording = bool(auto_listen_runtime.get("last_recording", False))
+            start_event = float(auto_listen_runtime.get("last_start_event", 0.0))
+            end_event = float(auto_listen_runtime.get("last_end_event", 0.0))
+            metrics = [
+                {
+                    "label": "Speech Prob",
+                    "value": min(1.0, max(0.0, speech_prob)),
+                    "threshold": min(1.0, max(0.0, speech_prob_threshold)),
+                    "active": speech,
+                },
+                {
+                    "label": "Start Event",
+                    "value": 1.0 if start_event > 0.0 else 0.0,
+                    "threshold": 1.0,
+                    "active": start_event > 0.0,
+                },
+                {
+                    "label": "End Event",
+                    "value": 1.0 if end_event > 0.0 else 0.0,
+                    "threshold": 1.0,
+                    "active": end_event > 0.0,
+                },
+                {
+                    "label": "Segment Open",
+                    "value": 1.0 if speech_started else 0.0,
+                    "threshold": 1.0,
+                    "active": speech_started,
+                },
+                {
+                    "label": "Segment Length",
+                    "value": min(1.0, speech_frames / max(1, int(auto_listen_runtime.get("last_display_segment_frames", 1)))),
+                    "threshold": 1.0,
+                    "active": speech_started,
+                },
+                {
+                    "label": "Recording State",
+                    "value": 1.0 if recording else 0.0,
+                    "threshold": 1.0,
+                    "active": recording,
+                },
+            ]
+            frame = build_audio_monitor_frame(np_mod, 0.0, 1.0, speech, metrics=metrics)
+            cv2_mod.putText(frame, "Silero VAD Monitor", (24, 30), cv2_mod.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2_mod.LINE_AA)
+            for idx, metric in enumerate(metrics):
+                text_y = 74 + idx * 42
+                state_text = "PASS" if metric["active"] else "WAIT"
+                value_text = f"{metric['value']:.2f}/{metric['threshold']:.2f}"
+                cv2_mod.putText(frame, f"{metric['label']}: {value_text} [{state_text}]", (24, text_y), cv2_mod.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2_mod.LINE_AA)
+            cv2_mod.putText(frame, f"speech>{speech_prob_threshold:.2f}", (24, 236), cv2_mod.FONT_HERSHEY_SIMPLEX, 0.5, (170, 170, 170), 1, cv2_mod.LINE_AA)
+            cv2_mod.imshow(window_name, frame)
+            key = cv2_mod.waitKey(50) & 0xFF
+            if key in (27, ord("q")):
+                stop_event.set()
+                break
+        with contextlib.suppress(Exception):
+            cv2_mod.destroyWindow(window_name)
+    except Exception as exc:
+        print_error_red(f"ERROR: Audio monitor failed: {exc}")
+
+
+def start_audio_monitor(auto_listen_runtime: dict) -> bool:
+    camera_runtime = auto_listen_runtime.get("camera_runtime")
+    if isinstance(camera_runtime, dict):
+        return True
+    stop_audio_monitor(auto_listen_runtime)
+    stop_event = threading.Event()
+    auto_listen_runtime["audio_monitor_stop_event"] = stop_event
+    thread = threading.Thread(target=_audio_monitor_worker, args=(auto_listen_runtime,), daemon=True)
+    auto_listen_runtime["audio_monitor_thread"] = thread
+    thread.start()
+    return True
+
+
+def _auto_listen_worker(auto_listen_runtime: dict) -> None:
+    stop_event = auto_listen_runtime.get("stop_event")
+    if stop_event is None:
+        return
+    config = auto_listen_runtime["voice_config"]
+    stt_runtime = auto_listen_runtime["stt_runtime"]
+    tts_runtime = auto_listen_runtime["tts_runtime"]
+    llm_state = auto_listen_runtime["llm_state"]
+    stats = auto_listen_runtime["stats"]
+    speaker = auto_listen_runtime.get("speaker")
+
+    np_mod = stt_runtime.get("numpy")
+    if np_mod is None:
+        print_error_red("ERROR: Auto-listen NumPy runtime is not initialized.")
+        return
+    stt_runtime["numpy"] = np_mod
+    sd_mod = stt_runtime.get("sounddevice")
+    if sd_mod is None:
+        print_error_red("ERROR: Auto-listen sounddevice runtime is not initialized.")
+        return
+    stt_runtime["sounddevice"] = sd_mod
+    silero_model = auto_listen_runtime.get("silero_model")
+    if silero_model is None:
+        print_error_red("ERROR: Auto-listen Silero VAD runtime is not initialized.")
+        return
+    auto_listen_runtime["silero_model"] = silero_model
+    silero_mod = auto_listen_runtime.get("silero_vad")
+    if silero_mod is None:
+        print_error_red("ERROR: Auto-listen Silero VAD package is not initialized.")
+        return
+    vad_iterator_cls = auto_listen_runtime.get("silero_vad_iterator_cls") or getattr(silero_mod, "VADIterator", None)
+    if vad_iterator_cls is None:
+        print_error_red("ERROR: Auto-listen Silero VAD iterator is not available.")
+        return
+    auto_listen_runtime["silero_vad_iterator_cls"] = vad_iterator_cls
+    torch_mod = stt_runtime.get("torch")
+    if torch_mod is None:
+        print_error_red("ERROR: Auto-listen PyTorch runtime is not initialized.")
+        return
+
+    sample_rate = 16000
+    frame_ms = int(config.get("auto_listen_frame_ms", 32))
+    if frame_ms not in {32, 64, 96}:
+        frame_ms = 32
+    frame_samples = {32: 512, 64: 1024, 96: 1536}.get(frame_ms, 512)
+    max_segment_frames = max(1, int(float(config.get("auto_listen_max_segment_s", 15.0)) * 1000 / frame_ms))
+    speech_threshold = float(config.get("auto_listen_threshold", 0.50))
+    audio_queue: queue.Queue = queue.Queue(maxsize=256)
+    state = {
+        "frame_ms": frame_ms,
+        "min_segment_ms": 0,
+    }
+    _reset_vad_segment_state(state)
+    auto_listen_runtime["last_speech_probability_threshold"] = speech_threshold
+    auto_listen_runtime["last_display_segment_frames"] = max_segment_frames
+    auto_listen_runtime["last_start_event"] = 0.0
+    auto_listen_runtime["last_end_event"] = 0.0
+    auto_listen_runtime["last_speech_probability"] = 0.0
+    vad_iterator = vad_iterator_cls(
+        silero_model,
+        threshold=speech_threshold,
+        sampling_rate=sample_rate,
+        min_silence_duration_ms=int(config.get("auto_listen_silence_ms", 1600)),
+        speech_pad_ms=int(config.get("auto_listen_preroll_ms", 350)),
+    )
+    with contextlib.suppress(Exception):
+        silero_model.reset_states()
+    with contextlib.suppress(Exception):
+        vad_iterator.reset_states()
+
+    def callback(indata, _frames, _time, status):
+        if status:
+            return
+        try:
+            audio_queue.put_nowait(indata.copy().tobytes())
+        except queue.Full:
+            pass
+
+    print("\n✅ Auto-listen Silero VAD active.\n")
+    try:
+        selected_device = resolve_audio_input_device(config, sd_mod)
+        with sd_mod.InputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=frame_samples,
+            device=selected_device,
+            callback=callback,
+        ):
+            while not stop_event.is_set():
+                if not bool(config.get("auto_listen_enabled", False)):
+                    time.sleep(0.05)
+                    continue
+                if is_tts_blocking_auto_listen(config):
+                    with contextlib.suppress(queue.Empty):
+                        while True:
+                            audio_queue.get_nowait()
+                    _reset_vad_segment_state(state)
+                    auto_listen_runtime["last_recording"] = False
+                    auto_listen_runtime["last_start_event"] = 0.0
+                    auto_listen_runtime["last_end_event"] = 0.0
+                    auto_listen_runtime["last_speech_probability"] = 0.0
+                    with contextlib.suppress(Exception):
+                        silero_model.reset_states()
+                    with contextlib.suppress(Exception):
+                        vad_iterator.reset_states()
+                    time.sleep(0.05)
+                    continue
+                try:
+                    frame_bytes = audio_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+
+                auto_listen_runtime["last_start_event"] = 0.0
+                auto_listen_runtime["last_end_event"] = 0.0
+                try:
+                    audio_i16 = np_mod.frombuffer(frame_bytes, dtype=np_mod.int16)
+                    audio = audio_i16.astype(np_mod.float32) / 32768.0
+                    audio_tensor = torch_mod.from_numpy(audio.copy())
+                    speech_prob = float(silero_model(audio_tensor, sample_rate).item())
+                    try:
+                        speech_dict = vad_iterator(audio_tensor, return_seconds=False)
+                    except TypeError:
+                        speech_dict = vad_iterator(audio_tensor)
+                except Exception:
+                    speech_prob = 0.0
+                    speech_dict = {}
+                is_speech = speech_prob >= speech_threshold
+                auto_listen_runtime["last_is_speech"] = bool(is_speech)
+                auto_listen_runtime["last_speech_probability"] = float(speech_prob)
+                auto_listen_runtime["last_speech_started"] = bool(state.get("speech_started", False))
+                auto_listen_runtime["last_speech_frames"] = len(state.get("speech_frames", []))
+                auto_listen_runtime["last_recording"] = bool(state.get("speech_started", False))
+                now_ts = time.monotonic()
+                if isinstance(speech_dict, dict) and "start" in speech_dict:
+                    state["speech_started"] = True
+                    state["speech_frames"] = []
+                    auto_listen_runtime["last_start_event"] = 1.0
+                if state["speech_started"]:
+                    state["speech_frames"].append(frame_bytes)
+                if isinstance(speech_dict, dict) and "end" in speech_dict:
+                    auto_listen_runtime["last_end_event"] = 1.0
+                if should_emit_auto_listen_log(auto_listen_runtime, now_ts):
+                    debug_text = format_vad_debug_output(
+                        {
+                            "speech": is_speech,
+                            "speech_prob": round(speech_prob, 3),
+                            "speech_threshold": speech_threshold,
+                            "speech_started": bool(state.get("speech_started", False)),
+                            "start_event": bool(auto_listen_runtime.get("last_start_event", 0.0)),
+                            "end_event": bool(auto_listen_runtime.get("last_end_event", 0.0)),
+                            "speech_frames": len(state.get("speech_frames", [])),
+                            "queue_size": int(audio_queue.qsize()),
+                        }
+                    )
+                    print(f"\n[vad-log] {debug_text}\n")
+
+                auto_listen_runtime["last_speech_started"] = bool(state.get("speech_started", False))
+                auto_listen_runtime["last_speech_frames"] = len(state.get("speech_frames", []))
+                auto_listen_runtime["last_recording"] = bool(state.get("speech_started", False))
+
+                if not state["speech_started"]:
+                    continue
+
+                if len(state["speech_frames"]) >= max_segment_frames:
+                    audio, discard_reason = _finalize_vad_segment(np_mod, state)
+                    with contextlib.suppress(Exception):
+                        silero_model.reset_states()
+                    with contextlib.suppress(Exception):
+                        vad_iterator.reset_states()
+                elif bool(auto_listen_runtime.get("last_end_event", 0.0)):
+                    audio, discard_reason = _finalize_vad_segment(np_mod, state)
+                    with contextlib.suppress(Exception):
+                        silero_model.reset_states()
+                    with contextlib.suppress(Exception):
+                        vad_iterator.reset_states()
+                else:
+                    audio, discard_reason = None, ""
+                if discard_reason and bool(config.get("vision_log_enabled", False)):
+                    print(f"\n[vad-log] segment discarded: {discard_reason}\n")
+                if audio is None:
+                    continue
+                auto_listen_runtime["last_recording"] = False
+                auto_listen_runtime["last_speech_started"] = False
+                auto_listen_runtime["last_speech_frames"] = 0
+                if bool(config.get("vision_log_enabled", False)):
+                    print(f"\n[vad-log] segment accepted: {len(audio) / sample_rate:0.2f}s\n")
+                text, _stt_time = transcribe_audio_buffer(stt_runtime, config, audio, speech_end_ts=time.perf_counter())
+                if text and not is_valid_auto_listen_transcript(text):
+                    if bool(config.get("vision_log_enabled", False)):
+                        print(f"\n[vad-log] transcript ignored: {text!r}\n")
+                    continue
+                if text:
+                    process_auto_listen_text(text, llm_state, stats, speaker, config, stt_runtime, tts_runtime)
+    except Exception as exc:
+        print_error_red(f"ERROR: Auto-listen stopped: {exc}")
+        if IS_WINDOWS:
+            print("Check Windows microphone privacy settings and the default recording device.\n")
+
+
+def stop_auto_listen(auto_listen_runtime: dict) -> None:
+    stop_event = auto_listen_runtime.get("stop_event")
+    thread = auto_listen_runtime.get("thread")
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2)
+    stop_audio_monitor(auto_listen_runtime)
+    auto_listen_runtime["thread"] = None
+    auto_listen_runtime["stop_event"] = None
+
+
+def start_auto_listen(auto_listen_runtime: dict, config: dict) -> bool:
+    stop_auto_listen(auto_listen_runtime)
+    if not prepare_auto_listen_runtime(auto_listen_runtime, config):
+        return False
+    config["auto_listen_enabled"] = True
+    auto_listen_runtime["voice_config"] = config
+    if bool(config.get("audio_monitor_enabled", False)):
+        start_audio_monitor(auto_listen_runtime)
+    stop_event = threading.Event()
+    auto_listen_runtime["stop_event"] = stop_event
+    thread = threading.Thread(target=_auto_listen_worker, args=(auto_listen_runtime,), daemon=True)
+    auto_listen_runtime["thread"] = thread
+    thread.start()
+    return True
 
 
 def split_tts_segment(buffer: str, min_words: int, cut_on_punctuation: bool) -> tuple[str, str]:
@@ -3744,6 +5748,24 @@ def show_voice_config(config: dict, speaker) -> None:
     print(f"  external_llm_model: {config.get('external_llm_model', '') or '(empty)'}")
     print(f"  external_llm_api_key: {'(set)' if str(config.get('external_llm_api_key', '')).strip() else '(empty)'}")
     print(f"  audio   : {'on' if bool(config.get('audio_enabled', True)) else 'off'}")
+    print(f"  audio_input_device: {config.get('audio_input_device', '') or '(default)'}")
+    print(f"  audio_monitor_enabled: {bool(config.get('audio_monitor_enabled', False))}")
+    print(f"  visual_effects_enabled: {bool(config.get('visual_effects_enabled', True))}")
+    print(f"  camera_enabled: {bool(config.get('camera_enabled', False))}")
+    print(f"  camera_device_index: {int(config.get('camera_device_index', 0))}")
+    print(f"  vision_enabled: {bool(config.get('vision_enabled', False))}")
+    print(f"  vision_model_id: {config.get('vision_model_id', '') or '(empty)'}")
+    print(f"  vision_model_path: {config.get('vision_model_path', '') or '(empty)'}")
+    print(f"  vision_labels_path: {config.get('vision_labels_path', '') or '(empty)'}")
+    print(f"  vision_device: {config.get('vision_device', 'AUTO')}")
+    print(f"  vision_threshold: {float(config.get('vision_threshold', 0.4)):.2f}")
+    print(f"  vision_log_enabled: {bool(config.get('vision_log_enabled', False))}")
+    print(f"  vision_log_interval_s: {float(config.get('vision_log_interval_s', 1.0)):.1f}")
+    print(f"  vision_event_processing_enabled: {bool(config.get('vision_event_processing_enabled', True))}")
+    print(f"  auto_listen_enabled: {bool(config.get('auto_listen_enabled', False))}")
+    print(f"  auto_listen_threshold: {float(config.get('auto_listen_threshold', 0.50)):.2f}")
+    print(f"  auto_listen_frame_ms: {int(config.get('auto_listen_frame_ms', 32))}")
+    print(f"  auto_listen_resume_delay_ms: {int(config.get('auto_listen_resume_delay_ms', 1500))}")
     print(f"  tts_streaming_enabled: {bool(config.get('tts_streaming_enabled', False))}")
     print(f"  tts_stream_min_words: {int(config.get('tts_stream_min_words', 12))}")
     print(f"  tts_stream_cut_on_punctuation: {bool(config.get('tts_stream_cut_on_punctuation', False))}")
@@ -3778,7 +5800,7 @@ def configure_voice_and_stt(
         "espeak_voices, espeak_voice, espeak_rate, espeak_pitch, espeak_amplitude, "
         "whisper, whisper_language, whisper_backend, whisper_ov_device, whisper_ov_model, whisper_ov_models, "
         "llm_backend, external_llm_base_url, external_llm_model, external_llm_api_key, "
-        "repeat, tts_streaming, tts_stream_min_words, tts_stream_punctuation, warmup_tts, max_tokens, system, show, exit"
+        "audio_inputs, audio_input, audio_monitor, repeat, log, log_interval, tts_streaming, tts_stream_min_words, tts_stream_punctuation, warmup_tts, max_tokens, system, show, exit"
     )
     show_voice_config(config, speaker)
 
@@ -4290,6 +6312,51 @@ def configure_voice_and_stt(
             if str(config.get("llm_backend", "local")).lower() == "external":
                 reload_llm_from_config()
             continue
+        if key == "audio_inputs":
+            sd_mod = stt_runtime.get("sounddevice") or ensure_dependency("sounddevice", "sounddevice", "SoundDevice")
+            if sd_mod is None:
+                continue
+            stt_runtime["sounddevice"] = sd_mod
+            devices = list_audio_input_devices(sd_mod)
+            if not devices:
+                print("No audio input devices were detected.")
+                continue
+            print("")
+            for idx, name, channels in devices:
+                marker = ""
+                current_audio = str(config.get("audio_input_device", "")).strip()
+                if current_audio and (current_audio == str(idx) or current_audio == name):
+                    marker = " (current)"
+                print(f"  - {name} [index={idx}, channels={channels}]{marker}")
+            print("")
+            continue
+        if key == "audio_input":
+            sd_mod = stt_runtime.get("sounddevice") or ensure_dependency("sounddevice", "sounddevice", "SoundDevice")
+            if sd_mod is None:
+                continue
+            stt_runtime["sounddevice"] = sd_mod
+            selected = choose_audio_input_device_interactive(sd_mod, str(config.get("audio_input_device", "")).strip())
+            if selected is None:
+                print("Cancelled.")
+                continue
+            config["audio_input_device"] = selected[0]
+            save_robot_config(config)
+            print(f"audio_input_device updated to: {selected[1]} [index={selected[0]}]")
+            continue
+        if key == "audio_monitor":
+            value = input("Set audio_monitor (true/false): ").strip().lower()
+            if value in {"true", "1", "on", "si", "sí", "yes", "y"}:
+                config["audio_monitor_enabled"] = True
+                save_robot_config(config)
+                print("audio_monitor_enabled updated to True")
+                continue
+            if value in {"false", "0", "off", "no", "n"}:
+                config["audio_monitor_enabled"] = False
+                save_robot_config(config)
+                print("audio_monitor_enabled updated to False")
+                continue
+            print("Invalid value. Use true or false.")
+            continue
         if key == "external_llm_model":
             value = input("Set external LLM model name: ").strip()
             if not value:
@@ -4480,179 +6547,187 @@ def run_chat_turn(
     stream_min_words = max(1, int(voice_config.get("tts_stream_min_words", 12)))
     stream_cut_on_punctuation = bool(voice_config.get("tts_stream_cut_on_punctuation", False))
     audio_enabled = bool(voice_config.get("audio_enabled", True))
-    stream_audio_active = stream_tts_enabled and audio_enabled
-    pending_tts_text = ""
-    tts_audio_queue: queue.Queue | None = queue.Queue() if stream_audio_active else None
-    tts_audio_thread: threading.Thread | None = None
-    tts_audio_stop_event = threading.Event()
-    tts_calc_latencies_s: list[float] = []
-
-    def esc_monitor():
-        with KEYBOARD.capture():
-            while not esc_stop_event.is_set():
-                if KEYBOARD.read_key_nonblocking() == "\x1b":
-                    esc_stop_event.set()
-                    tts_audio_stop_event.set()
-                    return
-                time.sleep(0.01)
-
-    def tts_worker():
-        if tts_audio_queue is None:
-            return
-        while not tts_audio_stop_event.is_set():
-            try:
-                item = tts_audio_queue.get(timeout=0.05)
-            except queue.Empty:
-                continue
-            if item is None:
-                return
-            text_piece = str(item).strip()
-            if not text_piece:
-                continue
-            try:
-                interrupted, calc_latency_s = speak_text_backend(
-                    speaker,
-                    text_piece,
-                    voice_config,
-                    tts_runtime,
-                    allow_interrupt=True,
-                )
-                tts_calc_latencies_s.append(float(calc_latency_s))
-                if interrupted:
-                    tts_audio_stop_event.set()
-                    esc_stop_event.set()
-            except Exception as exc:
-                print(f"\n⚠️ TTS failed: {exc}\n")
-                tts_audio_stop_event.set()
-                esc_stop_event.set()
-                return
-
-    if stream_audio_active:
-        tts_audio_thread = threading.Thread(target=tts_worker, daemon=True)
-        tts_audio_thread.start()
-
-    def streamer(chunk: str):
-        nonlocal first_token_time, token_events, pending_tts_text
-        if esc_stop_event.is_set():
-            raise RuntimeError("__ESC_ABORT__")
-        now = time.perf_counter()
-        if first_token_time is None:
-            first_token_time = now
-        token_events += 1
-        chunks.append(chunk)
-        print(chunk, end="", flush=True)
-        if stream_audio_active and tts_audio_queue is not None:
-            pending_tts_text += chunk
-            while True:
-                segment, rest = split_tts_segment(
-                    pending_tts_text,
-                    min_words=stream_min_words,
-                    cut_on_punctuation=stream_cut_on_punctuation,
-                )
-                if not segment:
-                    break
-                pending_tts_text = rest
-                if not tts_audio_stop_event.is_set():
-                    tts_audio_queue.put(segment)
-
-    print("🤖 > ", end="", flush=True)
-    esc_thread = threading.Thread(target=esc_monitor, daemon=True)
-    esc_thread.start()
+    response_audio_activity_started = False
+    if audio_enabled:
+        set_tts_activity(True)
+        response_audio_activity_started = True
     try:
-        pipe.generate(
-            prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=0.7,
-            top_p=0.9,
-            streamer=streamer,
-        )
-    except RuntimeError as exc:
-        if "__ESC_ABORT__" not in str(exc):
-            raise
-        generation_interrupted = True
-    finally:
-        esc_stop_event.set()
-        esc_thread.join(timeout=0.1)
-    if stream_audio_active and tts_audio_queue is not None:
-        if not generation_interrupted:
-            remaining = pending_tts_text.strip()
-            if remaining:
-                tts_audio_queue.put(remaining)
-        tts_audio_queue.put(None)
-        if tts_audio_thread is not None:
-            if generation_interrupted:
-                tts_audio_thread.join(timeout=0.2)
-            else:
-                tts_audio_thread.join()
-    t_end = time.perf_counter()
-    print("\n")
+        stream_audio_active = stream_tts_enabled and audio_enabled
+        pending_tts_text = ""
+        tts_audio_queue: queue.Queue | None = queue.Queue() if stream_audio_active else None
+        tts_audio_thread: threading.Thread | None = None
+        tts_audio_stop_event = threading.Event()
+        tts_calc_latencies_s: list[float] = []
 
-    if generation_interrupted:
-        print("⏹️ Generation interrupted by ESC.")
-        if timings is not None:
-            timings["text_to_llm_response_s"] = t_end - t_start
-            timings["text_to_audio_s"] = None
-        return False
+        def esc_monitor():
+            with KEYBOARD.capture():
+                while not esc_stop_event.is_set():
+                    if is_audio_cancel_requested() or KEYBOARD.read_key_nonblocking() == "\x1b":
+                        esc_stop_event.set()
+                        tts_audio_stop_event.set()
+                        return
+                    time.sleep(0.01)
 
-    if first_token_time is None:
-        ttft = t_end - t_start
-        tps = 0.0
-    else:
-        ttft = first_token_time - t_start
-        decode_time = max(1e-9, t_end - first_token_time)
-        tps = token_events / decode_time
+        def tts_worker():
+            if tts_audio_queue is None:
+                return
+            while not tts_audio_stop_event.is_set():
+                try:
+                    item = tts_audio_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    return
+                text_piece = str(item).strip()
+                if not text_piece:
+                    continue
+                try:
+                    interrupted, calc_latency_s = speak_text_backend(
+                        speaker,
+                        text_piece,
+                        voice_config,
+                        tts_runtime,
+                        allow_interrupt=True,
+                    )
+                    tts_calc_latencies_s.append(float(calc_latency_s))
+                    if interrupted:
+                        tts_audio_stop_event.set()
+                        esc_stop_event.set()
+                except Exception as exc:
+                    print(f"\n⚠️ TTS failed: {exc}\n")
+                    tts_audio_stop_event.set()
+                    esc_stop_event.set()
+                    return
 
-    stats_name = model_menu_label(current)
-    record_stats(
-        stats,
-        current["repo"],
-        stats_name,
-        ACTIVE_DEVICE,
-        ttft,
-        tps,
-        mode=STATS_MODE_NORMAL,
-    )
-    save_stats(stats)
-    print(f"📈 TTFT: {ttft:0.3f}s | TPS≈ {tps:0.2f} | events: {token_events}")
-    llm_roundtrip_s = t_end - t_start
-    if timings is not None:
-        timings["text_to_llm_response_s"] = llm_roundtrip_s
-    if show_roundtrip_lines:
-        print(f"⏱️ text -> llm response: {llm_roundtrip_s:0.3f}s")
+        if stream_audio_active:
+            tts_audio_thread = threading.Thread(target=tts_worker, daemon=True)
+            tts_audio_thread.start()
 
-    answer = "".join(chunks).strip()
-    if answer and audio_enabled and stream_audio_active:
-        audio_s = sum(tts_calc_latencies_s) if tts_calc_latencies_s else 0.0
-        if timings is not None:
-            timings["text_to_audio_s"] = audio_s
-        if show_roundtrip_lines:
-            print(f"⏱️ text -> audio: {audio_s:0.3f}s")
-    elif answer and audio_enabled:
+        def streamer(chunk: str):
+            nonlocal first_token_time, token_events, pending_tts_text
+            if esc_stop_event.is_set():
+                raise RuntimeError("__ESC_ABORT__")
+            now = time.perf_counter()
+            if first_token_time is None:
+                first_token_time = now
+            token_events += 1
+            chunks.append(chunk)
+            print(chunk, end="", flush=True)
+            if stream_audio_active and tts_audio_queue is not None:
+                pending_tts_text += chunk
+                while True:
+                    segment, rest = split_tts_segment(
+                        pending_tts_text,
+                        min_words=stream_min_words,
+                        cut_on_punctuation=stream_cut_on_punctuation,
+                    )
+                    if not segment:
+                        break
+                    pending_tts_text = rest
+                    if not tts_audio_stop_event.is_set() and not is_audio_cancel_requested():
+                        tts_audio_queue.put(segment)
+
+        print("🤖 > ", end="", flush=True)
+        esc_thread = threading.Thread(target=esc_monitor, daemon=True)
+        esc_thread.start()
         try:
-            interrupted, calc_latency_s = speak_text_backend(
-                speaker,
-                answer,
-                voice_config,
-                tts_runtime,
-                allow_interrupt=True,
+            pipe.generate(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=0.7,
+                top_p=0.9,
+                streamer=streamer,
             )
-            audio_s = calc_latency_s
+        except RuntimeError as exc:
+            if "__ESC_ABORT__" not in str(exc):
+                raise
+            generation_interrupted = True
+        finally:
+            esc_stop_event.set()
+            esc_thread.join(timeout=0.1)
+        if stream_audio_active and tts_audio_queue is not None:
+            if not generation_interrupted and not is_audio_cancel_requested():
+                remaining = pending_tts_text.strip()
+                if remaining:
+                    tts_audio_queue.put(remaining)
+            tts_audio_queue.put(None)
+            if tts_audio_thread is not None:
+                if generation_interrupted:
+                    tts_audio_thread.join(timeout=0.2)
+                else:
+                    tts_audio_thread.join()
+        t_end = time.perf_counter()
+        print("\n")
+
+        if generation_interrupted:
+            print("⏹️ Generation interrupted by ESC.")
+            if timings is not None:
+                timings["text_to_llm_response_s"] = t_end - t_start
+                timings["text_to_audio_s"] = None
+            return False
+
+        if first_token_time is None:
+            ttft = t_end - t_start
+            tps = 0.0
+        else:
+            ttft = first_token_time - t_start
+            decode_time = max(1e-9, t_end - first_token_time)
+            tps = token_events / decode_time
+
+        stats_name = model_menu_label(current)
+        record_stats(
+            stats,
+            current["repo"],
+            stats_name,
+            ACTIVE_DEVICE,
+            ttft,
+            tps,
+            mode=STATS_MODE_NORMAL,
+        )
+        save_stats(stats)
+        print(f"📈 TTFT: {ttft:0.3f}s | TPS≈ {tps:0.2f} | events: {token_events}")
+        llm_roundtrip_s = t_end - t_start
+        if timings is not None:
+            timings["text_to_llm_response_s"] = llm_roundtrip_s
+        if show_roundtrip_lines:
+            print(f"⏱️ text -> llm response: {llm_roundtrip_s:0.3f}s")
+
+        answer = "".join(chunks).strip()
+        if answer and audio_enabled and stream_audio_active:
+            audio_s = sum(tts_calc_latencies_s) if tts_calc_latencies_s else 0.0
             if timings is not None:
                 timings["text_to_audio_s"] = audio_s
             if show_roundtrip_lines:
                 print(f"⏱️ text -> audio: {audio_s:0.3f}s")
-            if interrupted:
-                print("⏹️ Audio interrupted by ESC.")
-        except Exception as exc:
-            print(f"\n⚠️ TTS failed: {exc}\n")
-    elif answer:
-        if timings is not None:
-            timings["text_to_audio_s"] = None
-        if show_roundtrip_lines:
-            print("⏱️ text -> audio: skipped (audio off)")
+        elif answer and audio_enabled:
+            try:
+                interrupted, calc_latency_s = speak_text_backend(
+                    speaker,
+                    answer,
+                    voice_config,
+                    tts_runtime,
+                    allow_interrupt=True,
+                )
+                audio_s = calc_latency_s
+                if timings is not None:
+                    timings["text_to_audio_s"] = audio_s
+                if show_roundtrip_lines:
+                    print(f"⏱️ text -> audio: {audio_s:0.3f}s")
+                if interrupted:
+                    print("⏹️ Audio interrupted by ESC.")
+            except Exception as exc:
+                print(f"\n⚠️ TTS failed: {exc}\n")
+        elif answer:
+            if timings is not None:
+                timings["text_to_audio_s"] = None
+            if show_roundtrip_lines:
+                print("⏱️ text -> audio: skipped (audio off)")
 
-    history.append("Assistant: (answer shown above)")
-    return True
+        history.append("Assistant: (answer shown above)")
+        return True
+    finally:
+        if response_audio_activity_started:
+            set_tts_activity(False)
 
 
 def print_startup_summary(current, voice_config: dict) -> None:
@@ -4706,6 +6781,23 @@ def print_startup_summary(current, voice_config: dict) -> None:
         ("Silence", str(voice_config.get("silence", 600))),
         ("Repeat Mode", str(bool(voice_config.get("repeat", False)))),
         ("Audio", "on" if bool(voice_config.get("audio_enabled", True)) else "off"),
+        ("Audio Input", str(voice_config.get("audio_input_device", "")) or "(default)"),
+        ("Audio Monitor", str(bool(voice_config.get("audio_monitor_enabled", False)))),
+        ("Visual Effects", str(bool(voice_config.get("visual_effects_enabled", True)))),
+        ("Camera", "on" if bool(voice_config.get("camera_enabled", False)) else "off"),
+        ("Camera Device", str(int(voice_config.get("camera_device_index", 0)))),
+        ("Vision", "on" if bool(voice_config.get("vision_enabled", False)) else "off"),
+        ("Vision Model ID", str(voice_config.get("vision_model_id", "")) or "(empty)"),
+        ("Vision Device", str(voice_config.get("vision_device", "AUTO"))),
+        ("Vision Threshold", f"{float(voice_config.get('vision_threshold', 0.4)):.2f}"),
+        ("Vision Model", str(voice_config.get("vision_model_path", "")) or "(empty)"),
+        ("Vision Log", str(bool(voice_config.get("vision_log_enabled", False)))),
+        ("Vision Log Interval", f"{float(voice_config.get('vision_log_interval_s', 1.0)):.1f}s"),
+        ("Vision Events", str(bool(voice_config.get("vision_event_processing_enabled", True)))),
+        ("Auto Listen", str(bool(voice_config.get("auto_listen_enabled", False)))),
+        ("VAD Threshold", f"{float(voice_config.get('auto_listen_threshold', 0.50)):.2f}"),
+        ("VAD Frame", f"{int(voice_config.get('auto_listen_frame_ms', 32))}ms"),
+        ("VAD Resume Delay", f"{int(voice_config.get('auto_listen_resume_delay_ms', 1500))}ms"),
         ("TTS streaming", str(bool(voice_config.get("tts_streaming_enabled", False)))),
         ("TTS stream min words", str(int(voice_config.get("tts_stream_min_words", 12)))),
         ("TTS stream punctuation", str(bool(voice_config.get("tts_stream_cut_on_punctuation", False)))),
@@ -4846,8 +6938,68 @@ def main() -> None:
         "torch": None,
         "compat": compat,
     }
+    speaker = None
+    voices = None
+    camera_runtime = {
+        "cv2": None,
+        "thread": None,
+        "vision_event_thread": None,
+        "vision_event_queue": None,
+        "stop_event": None,
+        "panel_enabled": False,
+        "active_device_index": None,
+        "speaker": speaker,
+        "voice_config": voice_config,
+        "tts_runtime": tts_runtime,
+        "vision_log_enabled": bool(voice_config.get("vision_log_enabled", False)),
+        "vision_log_interval_s": float(voice_config.get("vision_log_interval_s", 1.0)),
+        "vision_log_last_ts": 0.0,
+        "vision_event_processing_enabled": bool(voice_config.get("vision_event_processing_enabled", True)),
+        "vision_event_last_ts": 0.0,
+        "vision_last_detection_count": 0,
+        "suppress_next_join_after_interrupt": False,
+        "robot_face_gesture": "",
+        "robot_face_gesture_until": 0.0,
+    }
+    llm_state = {
+        "pipe": pipe,
+        "current": current,
+        "history": history,
+        "server_state": server_state,
+        "compat": compat,
+    }
+    auto_listen_runtime = {
+        "thread": None,
+        "stop_event": None,
+        "audio_monitor_thread": None,
+        "audio_monitor_stop_event": None,
+        "voice_config": voice_config,
+        "stt_runtime": stt_runtime,
+        "tts_runtime": tts_runtime,
+        "speaker": speaker,
+        "llm_state": llm_state,
+        "stats": stats,
+        "silero_vad": None,
+        "silero_model": None,
+        "silero_vad_iterator_cls": None,
+        "cv2": None,
+        "last_is_speech": False,
+        "last_speech_probability": 0.0,
+        "last_speech_probability_threshold": 0.50,
+        "last_speech_started": False,
+        "last_speech_frames": 0,
+        "last_start_event": 0.0,
+        "last_end_event": 0.0,
+        "last_display_segment_frames": 1,
+        "last_recording": False,
+        "vad_log_last_ts": 0.0,
+    }
+    camera_runtime["auto_listen_runtime"] = auto_listen_runtime
+    auto_listen_runtime["camera_runtime"] = camera_runtime
 
     speaker, voices, voice_error = initialize_native_voice_engine(voice_config)
+    camera_runtime["speaker"] = speaker
+    auto_listen_runtime["speaker"] = speaker
     if speaker is not None and voices is not None:
         save_robot_config(voice_config)
     else:
@@ -4858,9 +7010,23 @@ def main() -> None:
             print("   The chat will continue. Use eSpeak NG or another non-Windows TTS backend.\n")
 
     try:
+        print("Loading Whisper STT backend...")
+        if ensure_stt_runtime(stt_runtime, voice_config):
+            backend_name = "openvino" if bool(voice_config.get("whisper_openvino", False)) else "whisper"
+            print(f"✅ Whisper STT ready: {backend_name}\n")
+        else:
+            print("\n⚠️ Whisper STT could not be preloaded. It will be retried on first use.\n")
+    except Exception as exc:
+        print(f"\n⚠️ Whisper STT preload failed: {exc}")
+        print("   It will be retried on first use.\n")
+
+    try:
         pipe, current, history = activate_llm_from_config(voice_config, compat=compat)
         server_state["pipe"] = pipe
         server_state["current"] = current
+        llm_state["pipe"] = pipe
+        llm_state["current"] = current
+        llm_state["history"] = history
         if current is not None:
             print(f"✅ Auto-loaded LLM on startup: {model_menu_label(current)}")
     except Exception as exc:
@@ -4869,14 +7035,31 @@ def main() -> None:
         history = []
         server_state["pipe"] = None
         server_state["current"] = None
+        llm_state["pipe"] = None
+        llm_state["current"] = None
+        llm_state["history"] = history
         print(f"⚠️ Could not auto-load configured LLM on startup: {exc}")
 
+    voice_config["camera_enabled"] = False
+    voice_config["auto_listen_enabled"] = False
+    camera_runtime["camera_enabled"] = False
+    save_robot_config(voice_config)
     print_startup_logo()
     print_startup_summary(current, voice_config)
     print("Ready. Type '/help' to list commands.\n")
+    APP_EXIT_REQUESTED.clear()
 
     while True:
-        user_input = input("🧑 > ").strip()
+        if APP_EXIT_REQUESTED.is_set():
+            break
+        try:
+            user_input = input("🧑 > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            if APP_EXIT_REQUESTED.is_set():
+                print("")
+                break
+            print("")
+            continue
 
         if not user_input:
             continue
@@ -4888,6 +7071,12 @@ def main() -> None:
                 print("\n" + HELP_TEXT)
                 continue
 
+            if cmd == "panel":
+                if start_camera_panel(camera_runtime, voice_config):
+                    print("\n✅ panel = on\n")
+                    print("Use ESC or q in the panel window to close it.\n")
+                continue
+
             if cmd == "voices":
                 if speaker is None or voices is None:
                     print("\n⚠️ Voice engine is unavailable.\n")
@@ -4896,13 +7085,6 @@ def main() -> None:
                 continue
 
             if cmd == "config":
-                llm_state = {
-                    "pipe": pipe,
-                    "current": current,
-                    "history": history,
-                    "server_state": server_state,
-                    "compat": compat,
-                }
                 configure_voice_and_stt(
                     voice_config,
                     speaker,
@@ -4934,6 +7116,9 @@ def main() -> None:
                     pipe, current, history = activate_llm_from_config(voice_config, compat=compat)
                     server_state["pipe"] = pipe
                     server_state["current"] = current
+                    llm_state["pipe"] = pipe
+                    llm_state["current"] = current
+                    llm_state["history"] = history
                     if current is not None:
                         print(f"\n✅ llm_backend = {value} | loaded: {model_menu_label(current)}\n")
                     else:
@@ -4944,6 +7129,9 @@ def main() -> None:
                     history = []
                     server_state["pipe"] = None
                     server_state["current"] = None
+                    llm_state["pipe"] = None
+                    llm_state["current"] = None
+                    llm_state["history"] = history
                     print(f"\n❌ Failed to activate LLM backend '{value}': {exc}\n")
                 continue
 
@@ -4986,6 +7174,60 @@ def main() -> None:
                 print("\n⚠️ Use /repeat true|false\n")
                 continue
 
+            if cmd == "audio_inputs":
+                sd_mod = stt_runtime.get("sounddevice") or ensure_dependency("sounddevice", "sounddevice", "SoundDevice")
+                if sd_mod is None:
+                    continue
+                stt_runtime["sounddevice"] = sd_mod
+                devices = list_audio_input_devices(sd_mod)
+                if not devices:
+                    print("\nNo audio input devices were detected.\n")
+                    continue
+                print("\nAudio input devices:\n")
+                current_audio = str(voice_config.get("audio_input_device", "")).strip()
+                for idx, name, channels in devices:
+                    marker = " (current)" if current_audio and (current_audio == str(idx) or current_audio == name) else ""
+                    print(f"  - {name} [index={idx}, channels={channels}]{marker}")
+                print("")
+                continue
+
+            if cmd == "audio_input_select":
+                sd_mod = stt_runtime.get("sounddevice") or ensure_dependency("sounddevice", "sounddevice", "SoundDevice")
+                if sd_mod is None:
+                    continue
+                stt_runtime["sounddevice"] = sd_mod
+                selected = choose_audio_input_device_interactive(sd_mod, str(voice_config.get("audio_input_device", "")).strip())
+                if selected is None:
+                    print("\nCancelled.\n")
+                    continue
+                voice_config["audio_input_device"] = selected[0]
+                save_robot_config(voice_config)
+                print(f"\n✅ audio_input_device = {selected[1]} [index={selected[0]}]\n")
+                continue
+
+            if cmd.startswith("audio_monitor"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    state = "on" if bool(voice_config.get("audio_monitor_enabled", False)) else "off"
+                    print(f"\naudio_monitor is currently: {state}")
+                    print("Usage: /audio_monitor on|off\n")
+                    continue
+                value = parts[1].strip().lower()
+                if value in {"on", "1", "true", "yes", "y", "si", "sí"}:
+                    voice_config["audio_monitor_enabled"] = True
+                    save_robot_config(voice_config)
+                    start_audio_monitor(auto_listen_runtime)
+                    print("\n✅ audio_monitor = on\n")
+                    continue
+                if value in {"off", "0", "false", "no", "n"}:
+                    voice_config["audio_monitor_enabled"] = False
+                    save_robot_config(voice_config)
+                    stop_audio_monitor(auto_listen_runtime)
+                    print("\n✅ audio_monitor = off\n")
+                    continue
+                print("\n⚠️ Use /audio_monitor on|off\n")
+                continue
+
             if cmd.startswith("audio"):
                 parts = cmd.split(maxsplit=1)
                 if len(parts) != 2:
@@ -5005,6 +7247,197 @@ def main() -> None:
                     print("\n✅ audio = off\n")
                     continue
                 print("\n⚠️ Use /audio on|off\n")
+                continue
+
+            if cmd.startswith("camera") or cmd.startswith("camara"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    state = "on" if bool(voice_config.get("camera_enabled", False)) else "off"
+                    print(f"\ncamera is currently: {state}")
+                    print("Usage: /camera on|off\n")
+                    continue
+                value = parts[1].strip().lower()
+                if value in {"on", "1", "true", "yes", "y", "si", "sí"}:
+                    started = start_camera_preview(camera_runtime, voice_config)
+                    if started:
+                        print("Use '/camera off' to disable the camera feed.\n")
+                        if camera_runtime.get("thread") is None or not camera_runtime["thread"].is_alive():
+                            print("Use '/panel' to open the control panel window.\n")
+                    continue
+                if value in {"off", "0", "false", "no", "n"}:
+                    set_camera_enabled(camera_runtime, voice_config, False)
+                    continue
+                print("\n⚠️ Use /camera on|off\n")
+                continue
+
+            if cmd.startswith("log"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) == 1:
+                    state = "on" if bool(voice_config.get("vision_log_enabled", False)) else "off"
+                    interval_s = float(voice_config.get("vision_log_interval_s", 1.0))
+                    print(f"\nvision log is currently: {state}")
+                    print(f"vision log interval is currently: {interval_s:.1f}s")
+                    print("Usage: /log on|off|<seconds>|interval <seconds>\n")
+                    continue
+                value = parts[1].strip().lower()
+                if value in {"on", "1", "true", "yes", "y", "si", "sí"}:
+                    voice_config["vision_log_enabled"] = True
+                    save_robot_config(voice_config)
+                    camera_runtime["vision_log_enabled"] = True
+                    camera_runtime["vision_log_last_ts"] = 0.0
+                    print("\n✅ vision log = on\n")
+                    continue
+                if value in {"off", "0", "false", "no", "n"}:
+                    voice_config["vision_log_enabled"] = False
+                    save_robot_config(voice_config)
+                    camera_runtime["vision_log_enabled"] = False
+                    print("\n✅ vision log = off\n")
+                    continue
+                if value.startswith("interval "):
+                    value = value.split(maxsplit=1)[1].strip()
+                try:
+                    interval_s = max(0.1, float(value))
+                except ValueError:
+                    print("\n⚠️ Use /log on|off|<seconds>|interval <seconds>\n")
+                    continue
+                voice_config["vision_log_interval_s"] = interval_s
+                save_robot_config(voice_config)
+                camera_runtime["vision_log_interval_s"] = interval_s
+                camera_runtime["vision_log_last_ts"] = 0.0
+                camera_runtime["vision_event_last_ts"] = 0.0
+                print(f"\n✅ vision log interval = {interval_s:.1f}s\n")
+                continue
+
+            if cmd.startswith("vision_events"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    state = "on" if bool(voice_config.get("vision_event_processing_enabled", True)) else "off"
+                    print(f"\nvision_events is currently: {state}")
+                    print("Usage: /vision_events on|off\n")
+                    continue
+                value = parts[1].strip().lower()
+                if value in {"on", "1", "true", "yes", "y", "si", "sí"}:
+                    voice_config["vision_event_processing_enabled"] = True
+                    save_robot_config(voice_config)
+                    camera_runtime["vision_event_processing_enabled"] = True
+                    camera_runtime["vision_event_last_ts"] = 0.0
+                    camera_runtime["vision_last_detection_count"] = 0
+                    print("\n✅ vision_events = on\n")
+                    continue
+                if value in {"off", "0", "false", "no", "n"}:
+                    voice_config["vision_event_processing_enabled"] = False
+                    save_robot_config(voice_config)
+                    camera_runtime["vision_event_processing_enabled"] = False
+                    camera_runtime["vision_event_last_ts"] = 0.0
+                    camera_runtime["vision_last_detection_count"] = 0
+                    print("\n✅ vision_events = off\n")
+                    continue
+                print("\n⚠️ Use /vision_events on|off\n")
+                continue
+
+            if cmd.startswith("vision_model"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    print(f"\nvision_model_path is currently: {voice_config.get('vision_model_path', '') or '(empty)'}")
+                    print("Usage: /vision_model <path-to-model.xml>\n")
+                    continue
+                value = parts[1].strip().strip('"')
+                if not value:
+                    print("\n⚠️ vision_model path cannot be empty.\n")
+                    continue
+                voice_config["vision_model_path"] = value
+                save_robot_config(voice_config)
+                camera_runtime["vision_compiled_model"] = None
+                camera_runtime["vision_active_key"] = None
+                print(f"\n✅ vision_model_path = {value}\n")
+                continue
+
+            if cmd == "vision_models":
+                list_vision_models(load_vision_models(), str(voice_config.get("vision_model_id", "")).strip())
+                continue
+
+            if cmd == "vision_select":
+                models = load_vision_models()
+                selected = choose_vision_model_interactive(
+                    models,
+                    selected_id=str(voice_config.get("vision_model_id", "")).strip(),
+                    allow_download=True,
+                )
+                if selected is None:
+                    print("\nCancelled.\n")
+                    continue
+                selected_device = choose_vision_device_interactive(
+                    str(voice_config.get("vision_device", "AUTO")).strip()
+                )
+                if selected_device is None:
+                    print("\nCancelled.\n")
+                    continue
+                voice_config["vision_model_id"] = selected["id"]
+                voice_config["vision_model_path"] = str(selected["xml_path"])
+                voice_config["vision_device"] = selected_device
+                labels_path = selected["local"] / "labels.txt"
+                voice_config["vision_labels_path"] = str(labels_path) if labels_path.exists() else ""
+                save_robot_config(voice_config)
+                camera_runtime["vision_compiled_model"] = None
+                camera_runtime["vision_active_key"] = None
+                camera_runtime["vision_labels"] = list(selected.get("labels", []))
+                print(f"\n✅ Vision model selected: {selected['display']} [{selected['id']}] on {selected_device}\n")
+                continue
+
+            if cmd.startswith("vision_labels"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    print(f"\nvision_labels_path is currently: {voice_config.get('vision_labels_path', '') or '(empty)'}")
+                    print("Usage: /vision_labels <path-to-labels.txt>\n")
+                    continue
+                value = parts[1].strip().strip('"')
+                voice_config["vision_labels_path"] = value
+                save_robot_config(voice_config)
+                camera_runtime["vision_labels"] = load_vision_labels(value)
+                print(f"\n✅ vision_labels_path = {value or '(empty)'}\n")
+                continue
+
+            if cmd.startswith("vision_device"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    print(f"\nvision_device is currently: {voice_config.get('vision_device', 'AUTO')}")
+                    print("Usage: /vision_device CPU|GPU|NPU|AUTO\n")
+                    continue
+                value = parts[1].strip().upper()
+                if value not in {"CPU", "GPU", "NPU", "AUTO"}:
+                    print("\n⚠️ Use /vision_device CPU|GPU|NPU|AUTO\n")
+                    continue
+                voice_config["vision_device"] = value
+                save_robot_config(voice_config)
+                camera_runtime["vision_compiled_model"] = None
+                camera_runtime["vision_active_key"] = None
+                print(f"\n✅ vision_device = {value}\n")
+                continue
+
+            if cmd.startswith("vision"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    state = "on" if bool(voice_config.get("vision_enabled", False)) else "off"
+                    print(f"\nvision is currently: {state}")
+                    print("Usage: /vision on|off\n")
+                    continue
+                value = parts[1].strip().lower()
+                if value in {"on", "1", "true", "yes", "y", "si", "sí"}:
+                    if not ensure_vision_runtime(camera_runtime, voice_config):
+                        continue
+                    voice_config["vision_enabled"] = True
+                    save_robot_config(voice_config)
+                    camera_runtime["vision_enabled"] = True
+                    camera_runtime["vision_threshold"] = float(voice_config.get("vision_threshold", 0.4))
+                    print("\n✅ vision = on\n")
+                    continue
+                if value in {"off", "0", "false", "no", "n"}:
+                    voice_config["vision_enabled"] = False
+                    save_robot_config(voice_config)
+                    camera_runtime["vision_enabled"] = False
+                    print("\n✅ vision = off\n")
+                    continue
+                print("\n⚠️ Use /vision on|off\n")
                 continue
 
             if cmd.startswith("max_tokens"):
@@ -5028,6 +7461,29 @@ def main() -> None:
 
             if cmd == "listen":
                 run_listen_mode(pipe, current, history, stats, speaker, voice_config, stt_runtime, tts_runtime)
+                continue
+
+            if cmd.startswith("auto_listen"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    state = "on" if bool(voice_config.get("auto_listen_enabled", False)) else "off"
+                    print(f"\nauto_listen is currently: {state}")
+                    print("Usage: /auto_listen on|off\n")
+                    continue
+                value = parts[1].strip().lower()
+                if value in {"on", "1", "true", "yes", "y", "si", "sí"}:
+                    voice_config["auto_listen_enabled"] = True
+                    save_robot_config(voice_config)
+                    start_auto_listen(auto_listen_runtime, voice_config)
+                    print("\n✅ auto_listen = on\n")
+                    continue
+                if value in {"off", "0", "false", "no", "n"}:
+                    voice_config["auto_listen_enabled"] = False
+                    save_robot_config(voice_config)
+                    stop_auto_listen(auto_listen_runtime)
+                    print("\n✅ auto_listen = off\n")
+                    continue
+                print("\n⚠️ Use /auto_listen on|off\n")
                 continue
 
             if cmd == "whisper_models":
@@ -5284,6 +7740,10 @@ def main() -> None:
                     save_device_compat(compat)
                     server_state["pipe"] = pipe
                     server_state["current"] = current
+                    llm_state["pipe"] = pipe
+                    llm_state["current"] = current
+                    llm_state["history"] = history
+                    voice_config["llm_device"] = ACTIVE_DEVICE
                     voice_config["current_model_repo"] = current["repo"]
                     save_robot_config(voice_config)
                 except Exception as exc:
@@ -5294,6 +7754,9 @@ def main() -> None:
                     history = []
                     server_state["pipe"] = None
                     server_state["current"] = None
+                    llm_state["pipe"] = None
+                    llm_state["current"] = None
+                    llm_state["history"] = history
                     print(f"\n❌ Failed to load model on {ACTIVE_DEVICE}: {exc}\n")
                 continue
 
@@ -5313,6 +7776,8 @@ def main() -> None:
                     pipe = None
                     server_state["pipe"] = None
                     server_state["current"] = None
+                    llm_state["pipe"] = None
+                    llm_state["current"] = None
 
                 deleted = delete_model_files(to_delete)
 
@@ -5323,6 +7788,9 @@ def main() -> None:
                         history = []
                         server_state["pipe"] = None
                         server_state["current"] = None
+                        llm_state["pipe"] = None
+                        llm_state["current"] = None
+                        llm_state["history"] = history
                         voice_config["current_model_repo"] = ""
                         save_robot_config(voice_config)
                     else:
@@ -5356,6 +7824,8 @@ def main() -> None:
     if server is not None:
         server.shutdown()
         server.server_close()
+    stop_auto_listen(auto_listen_runtime)
+    stop_camera_preview(camera_runtime)
     print("Bye.")
 
 
