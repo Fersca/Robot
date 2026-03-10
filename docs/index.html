@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Robot</title>
+  <meta name="description" content="Cross-platform conversational assistant for Windows and Linux with OpenVINO, Whisper, Silero VAD, TTS backends, and optional camera/panel runtime.">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="site-shell">
+    <header class="hero">
+      <nav class="topbar">
+        <div class="brand">Robot</div>
+        <div class="toplinks">
+          <a href="#presence">Presence</a>
+          <a href="#features">Features</a>
+          <a href="#screens">Screens</a>
+          <a href="#commands">Commands</a>
+        </div>
+      </nav>
+
+      <section class="hero-grid">
+        <div class="hero-copy">
+          <p class="eyebrow">OpenVINO Voice + Vision Assistant</p>
+          <h1>Robot</h1>
+          <p class="lede">
+            A cross-platform desktop conversational assistant for Windows and Linux that combines local or external LLMs,
+            voice input, voice output, OpenVINO model utilities, and an optional camera and panel runtime.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="#quickstart">Quick Start</a>
+            <a class="button ghost" href="#commands">Commands</a>
+          </div>
+          <ul class="hero-bullets">
+            <li>Local LLMs with OpenVINO GenAI on CPU, GPU, and NPU</li>
+            <li>Whisper STT with startup preload and Silero VAD auto-listen</li>
+            <li>Multiple TTS backends plus optional camera presence reactions</li>
+          </ul>
+        </div>
+        <div class="hero-art">
+          <img src="./assets/robot.png" alt="Robot avatar">
+        </div>
+      </section>
+    </header>
+
+    <main>
+      <section class="section" id="overview">
+        <div class="section-head">
+          <p class="eyebrow">Overview</p>
+          <h2>What The Project Does</h2>
+        </div>
+        <div class="cards two">
+          <article class="card prose">
+            <p><code>robot.py</code> works as an interactive REPL.</p>
+            <ol>
+              <li>Loads configuration from <code>robot_config.json</code>.</li>
+              <li>Loads model catalogs from <code>~/ov_models</code>.</li>
+              <li>Preloads the configured Whisper backend.</li>
+              <li>Tries to restore the previously used LLM.</li>
+              <li>Waits for commands or regular prompts.</li>
+              <li>Either repeats text through TTS or sends it to the active LLM.</li>
+            </ol>
+          </article>
+          <article class="card prose">
+            <p>It also supports:</p>
+            <ul>
+              <li>manual <code>/listen</code> with <code>SPACE</code> and <code>ESC</code></li>
+              <li>continuous <code>/auto_listen on</code> with Silero VAD</li>
+              <li>an optional <code>/panel</code> window with avatar, camera, toggles, and VAD bars</li>
+              <li>headless camera and vision processing when the panel is closed</li>
+              <li>an OpenAI-compatible endpoint at <code>/v1/chat/completions</code></li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="presence">
+        <div class="section-head">
+          <p class="eyebrow">Presence And Panel</p>
+          <h2>Reactive camera presence with an optional robotics-style control surface</h2>
+        </div>
+        <div class="feature-layout">
+          <div class="prose feature-copy">
+            <p>The optional control panel shows a robot avatar, camera area, runtime switches, and audio/VAD bars.</p>
+            <p>With a face detection model enabled, the assistant can:</p>
+            <ul>
+              <li>detect when people appear in the camera</li>
+              <li>greet people when they arrive</li>
+              <li>say contextual lines when the visible count changes</li>
+              <li>react when it is left alone</li>
+              <li>interrupt its own audio and say <code>me cayo</code> if everyone disappears while it is speaking</li>
+            </ul>
+            <p>The camera worker is independent from the panel, so <code>/camera on</code>, <code>/vision on</code>, and <code>/vision_events on</code> can keep running without rendering the window.</p>
+          </div>
+          <figure class="feature-shot">
+            <img src="./assets/panel.png" alt="Robot control panel">
+          </figure>
+        </div>
+      </section>
+
+      <section class="section" id="features">
+        <div class="section-head">
+          <p class="eyebrow">Capabilities</p>
+          <h2>Functionality Overview</h2>
+        </div>
+        <div class="feature-grid">
+          <article class="feature-card">
+            <h3>LLM Runtime</h3>
+            <p>Local LLM chat through OpenVINO GenAI on CPU, GPU, NPU, or AUTO, plus external OpenAI-compatible backends.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Speech Stack</h3>
+            <p>Classic Whisper and OpenVINO Whisper STT, Whisper preload on startup, and continuous auto-listen with Silero VAD.</p>
+          </article>
+          <article class="feature-card">
+            <h3>TTS Options</h3>
+            <p>Windows SAPI, Parler, OpenVINO, Kokoro, BabelVox, and eSpeak NG with optional streaming while the LLM is generating.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Vision Events</h3>
+            <p>OpenVINO face detection, presence-aware behavior, throttled logging, and optional headless camera processing.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Developer Tools</h3>
+            <p>Benchmarking, compatibility tracking, JSON catalogs under <code>~/ov_models</code>, and an OpenAI-compatible local server.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Platform Support</h3>
+            <p>Windows and Linux with OS-specific dependency files, install scripts, and adaptive backend behavior.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="backends">
+        <div class="section-head">
+          <p class="eyebrow">Backends</p>
+          <h2>Supported Runtime Pieces</h2>
+        </div>
+        <div class="cards three">
+          <article class="card">
+            <h3>LLM</h3>
+            <ul class="plain-list">
+              <li>Local via <code>openvino_genai.LLMPipeline</code></li>
+              <li>External via an OpenAI-compatible API</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>Speech-to-Text</h3>
+            <ul class="plain-list">
+              <li><code>openai-whisper</code></li>
+              <li><code>openvino_genai.WhisperPipeline</code></li>
+              <li>Silero VAD for segmentation</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>Text-to-Speech</h3>
+            <ul class="plain-list">
+              <li>Windows SAPI</li>
+              <li>Parler-TTS</li>
+              <li>OpenVINO TTS</li>
+              <li>Kokoro ONNX</li>
+              <li>BabelVox</li>
+              <li>eSpeak NG</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="screens">
+        <div class="section-head">
+          <p class="eyebrow">Screenshots</p>
+          <h2>Examples</h2>
+        </div>
+        <div class="gallery">
+          <figure class="shot">
+            <img src="./assets/phi_4_npu.png" alt="Phi-4 loaded on NPU">
+            <figcaption>Phi-4 loaded on the Intel NPU.</figcaption>
+          </figure>
+          <figure class="shot">
+            <img src="./assets/npu_usage.png" alt="NPU usage">
+            <figcaption>NPU utilization while the assistant is running.</figcaption>
+          </figure>
+          <figure class="shot">
+            <img src="./assets/model_list.png" alt="Model list">
+            <figcaption>The interactive model selection list.</figcaption>
+          </figure>
+          <figure class="shot">
+            <img src="./assets/chat_example.png" alt="Chat example">
+            <figcaption>A console chat example.</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="section" id="quickstart">
+        <div class="section-head">
+          <p class="eyebrow">Setup</p>
+          <h2>Quick Start</h2>
+        </div>
+        <div class="cards two">
+          <article class="card prose">
+            <h3>Windows</h3>
+            <pre><code>pip install -r .\requirements-windows.txt
+python .\robot.py</code></pre>
+          </article>
+          <article class="card prose">
+            <h3>Linux</h3>
+            <pre><code>pip install -r ./requirements-linux.txt
+python ./robot.py</code></pre>
+            <p>Install <code>espeak-ng</code> and PortAudio system packages first.</p>
+          </article>
+        </div>
+        <article class="card prose sequence">
+          <h3>Recommended first session</h3>
+          <ol>
+            <li>Run <code>/models</code>.</li>
+            <li>Choose a local LLM or configure <code>/llm_backend external</code>.</li>
+            <li>Adjust audio and STT settings with <code>/config</code>.</li>
+            <li>Optionally run <code>/panel</code>.</li>
+            <li>Optionally enable <code>/camera on</code>, <code>/vision on</code>, and <code>/vision_events on</code>.</li>
+            <li>Try <code>/listen</code>, <code>/auto_listen on</code>, or type prompts directly.</li>
+          </ol>
+        </article>
+      </section>
+
+      <section class="section" id="commands">
+        <div class="section-head">
+          <p class="eyebrow">Reference</p>
+          <h2>Main Commands</h2>
+        </div>
+        <div class="command-grid">
+          <div class="command-col">
+            <code>/help</code>
+            <code>/models</code>
+            <code>/add_model</code>
+            <code>/delete</code>
+            <code>/config</code>
+            <code>/voices</code>
+            <code>/llm_backend local|external</code>
+            <code>/tts_backend windows|parler|openvino|kokoro|babelvox|espeakng</code>
+            <code>/repeat true|false</code>
+            <code>/listen</code>
+            <code>/auto_listen on|off</code>
+            <code>/start_server</code>
+            <code>/exit</code>
+          </div>
+          <div class="command-col">
+            <code>/audio on|off</code>
+            <code>/audio_inputs</code>
+            <code>/audio_input_select</code>
+            <code>/audio_monitor on|off</code>
+            <code>/panel</code>
+            <code>/camera on|off</code>
+            <code>/vision on|off</code>
+            <code>/vision_events on|off</code>
+            <code>/vision_models</code>
+            <code>/vision_select</code>
+            <code>/vision_model</code>
+            <code>/vision_labels</code>
+            <code>/vision_device &lt;name&gt;</code>
+            <code>/log on|off|seconds</code>
+          </div>
+          <div class="command-col">
+            <code>/whisper_models</code>
+            <code>/whisper_add</code>
+            <code>/whisper_select</code>
+            <code>/parler_models</code>
+            <code>/parler_add</code>
+            <code>/parler_select</code>
+            <code>/openvino_tts_models</code>
+            <code>/openvino_tts_add</code>
+            <code>/openvino_tts_select</code>
+            <code>/kokoro_models</code>
+            <code>/kokoro_select</code>
+            <code>/babelvox_models</code>
+            <code>/babelvox_select</code>
+            <code>/stats</code>
+            <code>/all_models</code>
+            <code>/clear_stats</code>
+            <code>/benchmark</code>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="files">
+        <div class="section-head">
+          <p class="eyebrow">Project Files</p>
+          <h2>Important Files</h2>
+        </div>
+        <div class="cards two">
+          <article class="card prose">
+            <ul>
+              <li><code>robot.py</code>: main application</li>
+              <li><code>robot_config.json</code>: persisted configuration</li>
+              <li><code>AGENTS.md</code>: repo context for coding agents</li>
+              <li><code>vision_models.json</code>: vision model catalog</li>
+              <li><code>ov_models/models.json</code>: LLM model catalog</li>
+            </ul>
+          </article>
+          <article class="card prose">
+            <p>The main configuration stores:</p>
+            <ul>
+              <li>LLM backend and active device</li>
+              <li>TTS backend</li>
+              <li>Whisper backend and model settings</li>
+              <li>camera, panel, and vision options</li>
+              <li>auto-listen and Silero VAD settings</li>
+              <li>TTS streaming and system prompt options</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

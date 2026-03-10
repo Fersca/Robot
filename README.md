@@ -1,6 +1,7 @@
 # Robot
 
-A cross-platform desktop conversational assistant for Windows and Linux that combines local or external LLMs, voice input, voice output, OpenVINO model utilities, and an optional camera/panel runtime.
+| ![Robot](./screenshots/robot.png) | A cross-platform desktop conversational assistant for Windows and Linux that combines local or external LLMs, voice input, voice output, OpenVINO model utilities, and an optional camera/panel runtime. |
+| --- | --- |
 
 The core of the project is [`robot.py`](./robot.py). From an interactive console it can:
 
@@ -37,6 +38,8 @@ It also supports:
 ## Presence And Panel
 
 The optional control panel shows a robot avatar, camera area, runtime switches, and audio/VAD bars.
+
+![Robot control panel](./screenshots/panel.png)
 
 With a face detection model enabled, the assistant can:
 
@@ -121,12 +124,6 @@ The model selection list used to choose which LLM to load.
 Example of a chat session in the interactive console.
 
 ![Chat example](./screenshots/chat_example.png)
-
-### Control Panel And Presence Detection
-
-The optional panel shows the robot avatar, camera area, runtime toggles, and audio/VAD bars. With vision enabled, the robot can detect people entering or leaving, greet them, and react when it is left alone.
-
-![Robot control panel](./screenshots/panel.png)
 
 ## Requirements
 
