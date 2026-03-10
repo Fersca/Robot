@@ -3,6 +3,13 @@
 | ![Robot](./screenshots/robot.png) | A cross-platform desktop conversational assistant for Windows and Linux that combines local or external LLMs, voice input, voice output, OpenVINO model utilities, and an optional camera/panel runtime. |
 | --- | --- |
 
+Built to take advantage of Intel Core Ultra capabilities through OpenVINO:
+
+- voice activity detection runs on CPU
+- speech-to-text transcription can run through OpenVINO Whisper on GPU
+- video detection can run on the NPU
+- the LLM can run on GPU, NPU, or through an OpenAI-compatible API
+
 The core of the project is [`robot.py`](./robot.py). From an interactive console it can:
 
 - load local LLMs from Hugging Face using OpenVINO GenAI
