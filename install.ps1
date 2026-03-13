@@ -9,29 +9,26 @@ if ($python) {
   $pythonCmd = "python"
 }
 
-Write-Host "[1/5] Creating virtual environment..."
-& $pythonCmd -m venv .venv
-
-Write-Host "[2/5] Activating virtual environment..."
-$venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
-if (-not (Test-Path $venvPython)) {
-  throw "Virtual environment Python was not created at $venvPython"
+Write-Host "[1/3] Installing Python dependencies into the current Python environment..."
+& $pythonCmd -m pip install -r requirements-windows.txt
+if ($LASTEXITCODE -ne 0) {
+  throw "Dependency installation failed."
 }
 
-Write-Host "[3/5] Upgrading pip..."
-& $venvPython -m pip install --upgrade pip
+Write-Host "[2/3] Verifying Silero VAD..."
+& $pythonCmd -c "from silero_vad import load_silero_vad, VADIterator; model = load_silero_vad(); VADIterator(model, sampling_rate=16000); print('Silero VAD: OK')"
+if ($LASTEXITCODE -ne 0) {
+  throw "Silero VAD verification failed."
+}
 
-Write-Host "[4/5] Installing Python dependencies..."
-& $venvPython -m pip install -r requirements-windows.txt
-
-Write-Host "[5/5] Verifying Silero VAD..."
-& $venvPython -c "from silero_vad import load_silero_vad, VADIterator; model = load_silero_vad(); VADIterator(model, sampling_rate=16000); print('Silero VAD: OK')"
+Write-Host "[3/3] Showing active Python interpreter..."
+& $pythonCmd -c "import sys; print(sys.executable)"
+if ($LASTEXITCODE -ne 0) {
+  throw "Could not resolve active Python interpreter."
+}
 
 Write-Host ""
 Write-Host "Installation complete."
-Write-Host ""
-Write-Host "Activate the environment with:"
-Write-Host "  .\.venv\Scripts\Activate.ps1"
 Write-Host ""
 Write-Host "Run the app with:"
 Write-Host "  .\run.ps1"

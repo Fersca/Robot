@@ -18,7 +18,9 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import uuid
+import wave
 import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +39,11 @@ AUDIO_PLAYBACK_EVENT = threading.Event()
 LAST_TTS_ACTIVITY_END_TS = 0.0
 APP_EXIT_REQUESTED = threading.Event()
 AUDIO_CANCEL_EVENT = threading.Event()
+WINDOWS_TTS_LOCK = threading.RLock()
+SAPI_SVSFLAGSASYNC = 1
+SAPI_SVSFPURGEBEFORESPEAK = 2
+SAPI_SVSFISXML = 8
+WINDOWS_TTS_WARMUP_SILENCE_MS = 120
 
 try:
     import msvcrt  # type: ignore
@@ -60,8 +67,6 @@ def default_tts_backend_for_platform(platform_name: str) -> str:
 
 def normalize_tts_backend_for_platform(tts_backend: str, platform_name: str) -> str:
     backend = str(tts_backend or "").strip().lower()
-    if backend == "parler_ov":
-        backend = "openvino"
     if backend not in TTS_BACKEND_OPTIONS:
         return default_tts_backend_for_platform(platform_name)
     if backend == "windows" and platform_name != "windows":
@@ -208,7 +213,6 @@ DEVICE_COMPAT_FILE = CACHE_DIR / "device_compat.json"
 MODELS_FILE = CACHE_DIR / "models.json"
 ROBOT_CONFIG_FILE = Path(__file__).resolve().parent / "robot_config.json"
 WHISPER_OV_MODELS_FILE = CACHE_DIR / "whisper_models.json"
-PARLER_OV_MODELS_FILE = CACHE_DIR / "parler_models.json"
 OV_TTS_MODELS_FILE = CACHE_DIR / "openvino_tts_models.json"
 KOKORO_MODELS_FILE = CACHE_DIR / "kokoro_models.json"
 BABELVOX_MODELS_FILE = CACHE_DIR / "babelvox_models.json"
@@ -358,42 +362,10 @@ DEFAULT_WHISPER_OV_MODELS_DATA = [
     },
 ]
 
-TTS_BACKEND_OPTIONS = ["windows", "parler", "openvino", "kokoro", "babelvox", "espeakng"]
+TTS_BACKEND_OPTIONS = ["windows", "openvino", "kokoro", "babelvox", "espeakng", "tada"]
 DEFAULT_TTS_BACKEND = default_tts_backend_for_platform(PLATFORM_NAME)
 KEYBOARD = create_keyboard_adapter(PLATFORM_NAME)
 PARLER_OV_DEVICE_OPTIONS = ["AUTO", "CPU", "GPU", "NPU"]
-PARLER_OV_EXPECTED_SIZE_BYTES = {
-    "parler-tts/parler-tts-mini-v1": 2600 * 1024 * 1024,
-    "parler-tts/parler-tts-large-v1": 5000 * 1024 * 1024,
-    "parler-tts/parler-tts-mini-expresso": 2600 * 1024 * 1024,
-    "parler-tts/parler-tts-mini-multilingual-v1.1": 2800 * 1024 * 1024,
-}
-DEFAULT_PARLER_OV_MODELS_DATA = [
-    {
-        "id": "parler-mini-v1",
-        "display": "Parler-TTS Mini v1",
-        "repo_url": "parler-tts/parler-tts-mini-v1",
-        "local_dir": "parler-tts-mini-v1",
-    },
-    {
-        "id": "parler-large-v1",
-        "display": "Parler-TTS Large v1",
-        "repo_url": "parler-tts/parler-tts-large-v1",
-        "local_dir": "parler-tts-large-v1",
-    },
-    {
-        "id": "parler-mini-expresso",
-        "display": "Parler-TTS Mini Expresso",
-        "repo_url": "parler-tts/parler-tts-mini-expresso",
-        "local_dir": "parler-tts-mini-expresso",
-    },
-    {
-        "id": "parler-mini-multilingual-v1.1",
-        "display": "Parler-TTS Mini Multilingual v1.1",
-        "repo_url": "parler-tts/parler-tts-mini-multilingual-v1.1",
-        "local_dir": "parler-tts-mini-multilingual-v1.1",
-    },
-]
 OV_TTS_EXPECTED_SIZE_BYTES = {
     "llmware/speech-t5-tts-ov": 430 * 1024 * 1024,
     "suno/bark-small": 2300 * 1024 * 1024,
@@ -779,6 +751,22 @@ def download_whisper_ov_model(model: dict) -> None:
     print("\n✅ Whisper OV download complete.\n")
 
 
+def download_repo_model(model: dict, label: str) -> None:
+    load_hf_token()
+    model["local"].parent.mkdir(parents=True, exist_ok=True)
+    repo_id = normalize_hf_repo_id(model["repo_url"])
+    print(f"\n📥 Downloading {label}: {model['repo_url']}")
+    print(f"   -> destination: {model['local']}\n")
+    snapshot_download(
+        repo_id=repo_id,
+        local_dir=str(model["local"]),
+        local_dir_use_symlinks=False,
+        resume_download=True,
+        token=os.environ.get("HF_TOKEN") or None,
+    )
+    print(f"\n✅ {label} download complete.\n")
+
+
 def whisper_ov_status_line(model: dict, selected_id: str | None = None) -> str:
     downloaded = is_downloaded(model["local"])
     icon = "✅" if downloaded else "⬇️"
@@ -815,160 +803,6 @@ def choose_whisper_ov_model_interactive(models: list[dict], selected_id: str | N
             model = models[int(choice) - 1]
             if allow_download and not is_downloaded(model["local"]):
                 download_whisper_ov_model(model)
-            return model
-        print("Invalid option.")
-
-
-def parler_ov_to_storage_entry(model: dict) -> dict:
-    payload = {
-        "id": model["id"],
-        "display": model["display"],
-        "repo_url": model["repo_url"],
-        "local_dir": model["local"].name,
-    }
-    expected_bytes = int(model.get("expected_size_bytes", 0) or 0)
-    if expected_bytes > 0:
-        payload["expected_size_bytes"] = expected_bytes
-    return payload
-
-
-def parse_parler_ov_entry(entry: dict) -> dict | None:
-    if not isinstance(entry, dict):
-        return None
-    model_id = str(entry.get("id", "")).strip()
-    display = str(entry.get("display", "")).strip()
-    repo_url = str(entry.get("repo_url", "")).strip()
-    local_dir = str(entry.get("local_dir", "")).strip()
-    if not model_id or not display or not repo_url:
-        return None
-    if not local_dir:
-        local_dir = slug_from_repo(repo_url)
-    expected_size_bytes = 0
-    if isinstance(entry.get("expected_size_bytes"), int):
-        expected_size_bytes = int(entry.get("expected_size_bytes") or 0)
-    elif isinstance(entry.get("expected_size_mb"), (int, float)):
-        expected_size_bytes = int(float(entry.get("expected_size_mb")) * 1024 * 1024)
-    if expected_size_bytes <= 0:
-        expected_size_bytes = PARLER_OV_EXPECTED_SIZE_BYTES.get(normalize_hf_repo_id(repo_url).lower(), 0)
-    return {
-        "id": model_id,
-        "display": display,
-        "repo_url": repo_url,
-        "local": CACHE_DIR / local_dir,
-        "expected_size_bytes": expected_size_bytes,
-    }
-
-
-def save_parler_ov_models(models: list[dict]) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    payload = [parler_ov_to_storage_entry(m) for m in models]
-    PARLER_OV_MODELS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def load_parler_ov_models() -> list[dict]:
-    if PARLER_OV_MODELS_FILE.exists():
-        try:
-            raw = json.loads(PARLER_OV_MODELS_FILE.read_text(encoding="utf-8"))
-            if isinstance(raw, list):
-                parsed = [parse_parler_ov_entry(x) for x in raw]
-                models = [x for x in parsed if x is not None]
-                if models:
-                    return models
-        except Exception:
-            pass
-    defaults = []
-    for entry in DEFAULT_PARLER_OV_MODELS_DATA:
-        parsed = parse_parler_ov_entry(entry)
-        if parsed is not None:
-            defaults.append(parsed)
-    save_parler_ov_models(defaults)
-    return defaults
-
-
-def add_parler_ov_model_interactive(models: list[dict]) -> dict | None:
-    print("\nAdd Parler model (CPU, no OpenVINO)\n")
-    model_id = input("Model id (unique): ").strip()
-    if not model_id:
-        print("\nCancelled: model id is required.\n")
-        return None
-    if any(m["id"] == model_id for m in models):
-        print("\n⚠️ A model with that id already exists.\n")
-        return None
-    display = input("Display name: ").strip()
-    if not display:
-        print("\nCancelled: display name is required.\n")
-        return None
-    repo_url = input("HF repo URL/id for Parler model: ").strip()
-    if not repo_url:
-        print("\nCancelled: repo URL/id is required.\n")
-        return None
-    default_local = slug_from_repo(repo_url)
-    local_dir = input(f"Local folder [{default_local}]: ").strip() or default_local
-    model = {
-        "id": model_id,
-        "display": display,
-        "repo_url": repo_url,
-        "local": CACHE_DIR / local_dir,
-        "expected_size_bytes": PARLER_OV_EXPECTED_SIZE_BYTES.get(normalize_hf_repo_id(repo_url).lower(), 0),
-    }
-    models.append(model)
-    save_parler_ov_models(models)
-    print(f"\n✅ Parler model added: {display} ({model_id})\n")
-    return model
-
-
-def download_parler_ov_model(model: dict) -> None:
-    load_hf_token()
-    model["local"].parent.mkdir(parents=True, exist_ok=True)
-    repo_id = normalize_hf_repo_id(model["repo_url"])
-    print(f"\n📥 Downloading Parler model: {model['repo_url']}")
-    print(f"   -> destination: {model['local']}\n")
-    snapshot_download(
-        repo_id=repo_id,
-        local_dir=str(model["local"]),
-        local_dir_use_symlinks=False,
-        resume_download=True,
-        token=os.environ.get("HF_TOKEN") or None,
-    )
-    print("\n✅ Parler model download complete.\n")
-
-
-def parler_ov_status_line(model: dict, selected_id: str | None = None) -> str:
-    downloaded = is_repo_downloaded(model["local"])
-    icon = "✅" if downloaded else "⬇️"
-    if downloaded:
-        size = human_bytes(dir_size_bytes(model["local"]))
-    else:
-        expected_size = int(model.get("expected_size_bytes", 0) or 0)
-        size = f"~{human_bytes(expected_size)}" if expected_size > 0 else "—"
-    selected = " (selected)" if selected_id and model["id"] == selected_id else ""
-    return f"{icon} {model['display']} [{model['id']}] ({size}){selected}"
-
-
-def list_parler_ov_models(models: list[dict], selected_id: str | None = None) -> None:
-    print("\nParler models (CPU, no OpenVINO):\n")
-    if not models:
-        print("(none configured)")
-        print(f"Edit {PARLER_OV_MODELS_FILE} or use /parler_add\n")
-        return
-    for i, model in enumerate(models, 1):
-        print(f"  {i}) {parler_ov_status_line(model, selected_id)}")
-    print("")
-
-
-def choose_parler_ov_model_interactive(models: list[dict], selected_id: str | None = None, allow_download: bool = True) -> dict | None:
-    list_parler_ov_models(models, selected_id)
-    if not models:
-        return None
-    print("  0) Cancel\n")
-    while True:
-        choice = input("Option: ").strip()
-        if choice == "0":
-            return None
-        if choice.isdigit() and 1 <= int(choice) <= len(models):
-            model = models[int(choice) - 1]
-            if allow_download and not is_repo_downloaded(model["local"]):
-                download_parler_ov_model(model)
             return model
         print("Invalid option.")
 
@@ -1614,6 +1448,30 @@ def format_vad_debug_output(payload: dict) -> str:
     return text
 
 
+def show_llm_context(history: list[str], config: dict) -> None:
+    memory = [str(item).strip() for item in list(history or []) if str(item).strip()]
+    system_prompt = str(config.get("system_prompt", "")).strip()
+    max_new_tokens = int(config.get("max_new_tokens", 300))
+    max_words_estimate = max(1, int(max_new_tokens * 0.65))
+    system_limit_note = f"Anexo: No respondas con mas de {max_words_estimate} palabras."
+    effective_system_prompt = (
+        f"{system_prompt}\n{system_limit_note}" if system_prompt else system_limit_note
+    )
+
+    print("\nCurrent LLM context:\n")
+    print("System:")
+    print("-----")
+    print(effective_system_prompt)
+    print("-----\n")
+    print(f"Memory entries: {len(memory)}")
+    if not memory:
+        print("(history is empty)\n")
+        return
+    for idx, item in enumerate(memory, 1):
+        print(f"{idx:>3}. {item}")
+    print("")
+
+
 def should_emit_vision_log(camera_runtime: dict, now_ts: float | None = None) -> bool:
     if not bool(camera_runtime.get("vision_log_enabled", False)):
         return False
@@ -1850,6 +1708,7 @@ def list_camera_devices(camera_runtime: dict, max_devices: int = 10) -> list[tup
 
 
 def stop_camera_preview(camera_runtime: dict) -> None:
+    stop_qt_panel(camera_runtime)
     stop_event = camera_runtime.get("stop_event")
     thread = camera_runtime.get("thread")
     event_thread = camera_runtime.get("vision_event_thread")
@@ -1868,6 +1727,25 @@ def stop_camera_preview(camera_runtime: dict) -> None:
     camera_runtime["panel_enabled"] = False
     camera_runtime["panel_button_rects"] = {}
     camera_runtime["panel_action_queue"] = None
+
+
+def stop_qt_panel(camera_runtime: dict) -> None:
+    stop_event = camera_runtime.get("qt_panel_stop_event")
+    if stop_event is not None:
+        with contextlib.suppress(Exception):
+            stop_event.set()
+    proc = camera_runtime.get("qt_panel_process")
+    if proc is not None and proc.is_alive():
+        proc.join(timeout=1.5)
+        if proc.is_alive():
+            with contextlib.suppress(Exception):
+                proc.terminate()
+            proc.join(timeout=1.0)
+    camera_runtime["qt_panel_process"] = None
+    camera_runtime["qt_panel_state_queue"] = None
+    camera_runtime["qt_panel_action_queue"] = None
+    camera_runtime["qt_panel_stop_event"] = None
+    camera_runtime["panel_backend"] = None
 
 
 def draw_robot_face(frame, np_mod, cv2_mod, rect: tuple[int, int, int, int], *, speaking: bool, listening: bool, gesture: str, visual_effects_enabled: bool) -> None:
@@ -2051,6 +1929,269 @@ def build_panel_frame(np_mod, cv2_mod, camera_frame, camera_enabled: bool, camer
     return frame, button_rects
 
 
+def _put_latest_panel_state(state_queue, payload: dict) -> None:
+    if state_queue is None:
+        return
+    try:
+        while True:
+            state_queue.get_nowait()
+    except Exception:
+        pass
+    with contextlib.suppress(Exception):
+        state_queue.put_nowait(payload)
+
+
+def _qt_panel_process_main(state_queue, action_queue, stop_event) -> None:
+    from PySide6 import QtCore, QtGui, QtWidgets
+
+    class RobotFaceWidget(QtWidgets.QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setMinimumSize(240, 420)
+            self._speaking = False
+            self._listening = False
+            self._gesture = ""
+            self._visual_effects_enabled = True
+
+        def set_state(self, speaking: bool, listening: bool, gesture: str, visual_effects_enabled: bool) -> None:
+            self._speaking = bool(speaking)
+            self._listening = bool(listening)
+            self._gesture = str(gesture or "")
+            self._visual_effects_enabled = bool(visual_effects_enabled)
+            self.update()
+
+        def paintEvent(self, _event):
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            rect = self.rect()
+            painter.fillRect(rect, QtGui.QColor(22, 24, 28))
+
+            face_bg = QtGui.QColor(32, 38, 46)
+            accent = QtGui.QColor(80, 190, 255)
+            accent_dim = QtGui.QColor(70, 110, 140)
+            metal = QtGui.QColor(180, 190, 205)
+            dark = QtGui.QColor(18, 24, 28)
+
+            t = time.monotonic()
+            x = 16
+            y = 16
+            w = rect.width() - 32
+            h = rect.height() - 32
+            painter.fillRect(QtCore.QRect(x, y, w, h), face_bg)
+
+            ear_offset = 0
+            if self._visual_effects_enabled and self._listening:
+                ear_offset = int(8 * (0.5 + 0.5 * math.sin(t * 14.0)))
+            ear_color = accent if self._listening else accent_dim
+            painter.fillRect(QtCore.QRect(x + 8, y + 90 - ear_offset, 22, 90), ear_color)
+            painter.fillRect(QtCore.QRect(x + w - 30, y + 90 - ear_offset, 22, 90), ear_color)
+
+            head_rect = QtCore.QRect(x + 36, y + 40, w - 72, h - 84)
+            painter.fillRect(head_rect, metal)
+            painter.fillRect(head_rect.adjusted(8, 8, -8, -8), QtGui.QColor(95, 102, 112))
+
+            blink = self._visual_effects_enabled and (math.sin(t * 1.4) > 0.985)
+            eye_h = 18
+            if self._gesture == "join":
+                eye_h = 22
+            elif self._gesture == "leave":
+                eye_h = 10
+            if blink:
+                eye_h = 4
+            painter.setBrush(dark)
+            painter.setPen(QtCore.Qt.NoPen)
+            left_eye = QtCore.QRect(x + 74, y + 118, 64, eye_h)
+            right_eye = QtCore.QRect(x + w - 138, y + 118, 64, eye_h)
+            painter.drawRoundedRect(left_eye, 12, 12)
+            painter.drawRoundedRect(right_eye, 12, 12)
+            if not blink:
+                painter.setBrush(accent)
+                painter.drawEllipse(QtCore.QPoint(x + 106, y + 127), 6, 6)
+                painter.drawEllipse(QtCore.QPoint(x + w - 106, y + 127), 6, 6)
+
+            mouth_open = 8
+            mouth_curve = 0
+            if self._visual_effects_enabled and self._speaking:
+                phase_a = 0.5 + 0.5 * math.sin(t * 13.0)
+                phase_b = 0.5 + 0.5 * math.sin(t * 21.0 + 0.9)
+                mouth_open = 6 + int(8 * phase_a + 6 * phase_b)
+                mouth_curve = int(5 * math.sin(t * 9.0 + 0.4))
+            elif self._gesture == "join":
+                mouth_open = 16
+                mouth_curve = -5
+            elif self._gesture == "leave":
+                mouth_open = 4
+                mouth_curve = 5
+            painter.setBrush(dark)
+            mouth_rect = QtCore.QRect(x + 82, y + 232 - mouth_open, w - 164, mouth_open * 2)
+            painter.drawRoundedRect(mouth_rect, 10, 10)
+            painter.setBrush(accent if self._speaking else accent_dim)
+            inner = mouth_rect.adjusted(6, 4 + mouth_curve, -6, -4 - mouth_curve)
+            painter.drawRoundedRect(inner, 8, 8)
+
+            painter.setBrush(accent if self._visual_effects_enabled else accent_dim)
+            painter.drawEllipse(QtCore.QPoint(x + w // 2, y + h - 46), 15, 15)
+            painter.setPen(dark)
+            font = painter.font()
+            font.setBold(True)
+            font.setPointSize(14)
+            painter.setFont(font)
+            painter.drawText(QtCore.QRect(x + w // 2 - 12, y + h - 59, 24, 24), QtCore.Qt.AlignCenter, "R")
+
+    class RobotQtPanel(QtWidgets.QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Robot Control Panel (Qt)")
+            self.resize(1380, 760)
+            self._state = {}
+
+            root = QtWidgets.QHBoxLayout(self)
+            root.setContentsMargins(18, 18, 18, 18)
+            root.setSpacing(18)
+
+            left = QtWidgets.QVBoxLayout()
+            left.setSpacing(12)
+            root.addLayout(left, 3)
+
+            self.face = RobotFaceWidget()
+            left.addWidget(self.face, 2)
+
+            self.camera_label = QtWidgets.QLabel("Camera Off")
+            self.camera_label.setAlignment(QtCore.Qt.AlignCenter)
+            self.camera_label.setMinimumSize(700, 420)
+            self.camera_label.setStyleSheet("background:#232323; border:1px solid #444; color:#bdbdbd;")
+            left.addWidget(self.camera_label, 3)
+
+            right = QtWidgets.QVBoxLayout()
+            right.setSpacing(10)
+            root.addLayout(right, 2)
+
+            title = QtWidgets.QLabel("Controls")
+            title.setStyleSheet("color:#f0f0f0; font-size:18px; font-weight:600;")
+            right.addWidget(title)
+
+            self.buttons = {}
+            for label, action in [
+                ("Camera", "toggle_camera"),
+                ("Vision", "toggle_vision"),
+                ("Auto Listen", "toggle_auto_listen"),
+                ("Audio", "toggle_audio"),
+                ("Vision Events", "toggle_vision_events"),
+                ("Log", "toggle_log"),
+                ("Audio Monitor", "toggle_audio_monitor"),
+                ("Visual Effects", "toggle_visual_effects"),
+            ]:
+                btn = QtWidgets.QPushButton(label)
+                btn.setCheckable(True)
+                btn.clicked.connect(lambda _checked=False, action=action: self._emit_action(action))
+                btn.setStyleSheet("QPushButton{padding:10px; text-align:left;} QPushButton:checked{background:#3a7f4a; color:white;}")
+                right.addWidget(btn)
+                self.buttons[action] = btn
+
+            exit_btn = QtWidgets.QPushButton("Exit")
+            exit_btn.clicked.connect(lambda: self._emit_action("exit_program"))
+            exit_btn.setStyleSheet("QPushButton{padding:10px; background:#7a3434; color:white;}")
+            right.addWidget(exit_btn)
+
+            metrics_title = QtWidgets.QLabel("Audio / VAD")
+            metrics_title.setStyleSheet("color:#f0f0f0; font-size:16px; font-weight:600; margin-top:8px;")
+            right.addWidget(metrics_title)
+
+            self.metric_rows = []
+            for _idx in range(6):
+                row = QtWidgets.QWidget()
+                layout = QtWidgets.QHBoxLayout(row)
+                layout.setContentsMargins(0, 0, 0, 0)
+                layout.setSpacing(8)
+                label = QtWidgets.QLabel("")
+                label.setMinimumWidth(120)
+                label.setStyleSheet("color:#d8d8d8;")
+                bar = QtWidgets.QProgressBar()
+                bar.setRange(0, 100)
+                bar.setTextVisible(False)
+                bar.setStyleSheet("QProgressBar{background:#333; border:1px solid #555; height:14px;} QProgressBar::chunk{background:#00aaff;}")
+                lamp = QtWidgets.QLabel("●")
+                lamp.setStyleSheet("color:#4a4a4a; font-size:16px;")
+                layout.addWidget(label)
+                layout.addWidget(bar, 1)
+                layout.addWidget(lamp)
+                right.addWidget(row)
+                self.metric_rows.append((label, bar, lamp, row))
+
+            right.addStretch(1)
+
+            self.timer = QtCore.QTimer(self)
+            self.timer.timeout.connect(self._poll_state)
+            self.timer.start(50)
+
+        def closeEvent(self, event):
+            self._emit_action("close_panel")
+            super().closeEvent(event)
+
+        def _emit_action(self, action: str) -> None:
+            with contextlib.suppress(Exception):
+                action_queue.put_nowait(str(action))
+
+        def _poll_state(self) -> None:
+            if stop_event.is_set():
+                self.close()
+                return
+            latest = None
+            while True:
+                try:
+                    latest = state_queue.get_nowait()
+                except Exception:
+                    break
+            if latest is None:
+                return
+            self._state = latest
+            self._apply_state(latest)
+
+        def _apply_state(self, state: dict) -> None:
+            face_state = state.get("face_state", {}) if isinstance(state, dict) else {}
+            self.face.set_state(
+                bool(face_state.get("speaking", False)),
+                bool(face_state.get("listening", False)),
+                str(face_state.get("gesture", "")),
+                bool(face_state.get("visual_effects_enabled", True)),
+            )
+            frame_bytes = state.get("camera_jpeg")
+            if frame_bytes:
+                image = QtGui.QImage.fromData(frame_bytes, "JPG")
+                if not image.isNull():
+                    pix = QtGui.QPixmap.fromImage(image)
+                    self.camera_label.setPixmap(pix.scaled(self.camera_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+                    self.camera_label.setText("")
+            else:
+                self.camera_label.setPixmap(QtGui.QPixmap())
+                placeholder = state.get("camera_placeholder", "Camera Off")
+                self.camera_label.setText(str(placeholder))
+
+            buttons = {str(item.get("action")): bool(item.get("active", False)) for item in state.get("button_specs", [])}
+            for action, btn in self.buttons.items():
+                btn.blockSignals(True)
+                btn.setChecked(buttons.get(action, False))
+                btn.blockSignals(False)
+
+            metrics = state.get("metrics", [])
+            show_audio_monitor = bool(state.get("show_audio_monitor", False))
+            for idx, (label, bar, lamp, row) in enumerate(self.metric_rows):
+                if idx < len(metrics) and show_audio_monitor:
+                    metric = metrics[idx]
+                    label.setText(str(metric.get("label", "")))
+                    bar.setValue(int(max(0.0, min(1.0, float(metric.get("value", 0.0)))) * 100.0))
+                    lamp.setStyleSheet("color:#26c96f; font-size:16px;" if bool(metric.get("active", False)) else "color:#4a4a4a; font-size:16px;")
+                    row.show()
+                else:
+                    row.hide()
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setStyle("Fusion")
+    panel = RobotQtPanel()
+    panel.show()
+    app.exec()
+
+
 def ensure_camera_worker(camera_runtime: dict, config: dict) -> bool:
     if not ensure_camera_runtime(camera_runtime):
         return False
@@ -2070,7 +2211,46 @@ def ensure_camera_worker(camera_runtime: dict, config: dict) -> bool:
     return True
 
 
-def start_camera_panel(camera_runtime: dict, config: dict) -> bool:
+def start_qt_panel(camera_runtime: dict, config: dict) -> bool:
+    pyside_mod = ensure_dependency("PySide6", "PySide6", "PySide6")
+    if pyside_mod is None:
+        return False
+    if not ensure_camera_worker(camera_runtime, config):
+        return False
+    existing = camera_runtime.get("qt_panel_process")
+    if existing is not None and existing.is_alive():
+        camera_runtime["panel_backend"] = "qt"
+        camera_runtime["panel_enabled"] = False
+        return True
+    ctx = mp.get_context("spawn")
+    state_queue = ctx.Queue(maxsize=1)
+    action_queue = ctx.Queue(maxsize=32)
+    stop_event = ctx.Event()
+    proc = ctx.Process(
+        target=_qt_panel_process_main,
+        args=(state_queue, action_queue, stop_event),
+        daemon=True,
+    )
+    proc.start()
+    camera_runtime["qt_panel_process"] = proc
+    camera_runtime["qt_panel_state_queue"] = state_queue
+    camera_runtime["qt_panel_action_queue"] = action_queue
+    camera_runtime["qt_panel_stop_event"] = stop_event
+    camera_runtime["panel_backend"] = "qt"
+    camera_runtime["panel_enabled"] = False
+    return True
+
+
+def start_camera_panel(camera_runtime: dict, config: dict, backend: str = "opencv") -> bool:
+    selected_backend = str(backend or "opencv").strip().lower()
+    if selected_backend not in {"opencv", "qt"}:
+        selected_backend = "opencv"
+    config["panel_backend"] = selected_backend
+    save_robot_config(config)
+    if selected_backend == "qt":
+        return start_qt_panel(camera_runtime, config)
+    stop_qt_panel(camera_runtime)
+    camera_runtime["panel_backend"] = "opencv"
     camera_runtime["panel_enabled"] = True
     return ensure_camera_worker(camera_runtime, config)
 
@@ -2158,12 +2338,18 @@ def _camera_preview_worker(camera_runtime: dict, _device_index_unused) -> None:
         while not stop_event.is_set():
             loop_started_ts = time.monotonic()
             config = camera_runtime.get("voice_config", {})
-            panel_enabled = bool(camera_runtime.get("panel_enabled", False))
+            panel_backend = str(camera_runtime.get("panel_backend") or config.get("panel_backend", "opencv")).strip().lower()
+            qt_proc = camera_runtime.get("qt_panel_process")
+            if panel_backend == "qt" and qt_proc is not None and not qt_proc.is_alive():
+                stop_qt_panel(camera_runtime)
+                panel_backend = ""
+            panel_enabled = bool(camera_runtime.get("panel_enabled", False)) and panel_backend == "opencv"
+            qt_panel_active = panel_backend == "qt" and qt_proc is not None and qt_proc.is_alive()
             if panel_enabled and not window_open:
                 cv2_mod.namedWindow(window_name)
                 cv2_mod.setMouseCallback(window_name, mouse_callback)
                 window_open = True
-            elif not panel_enabled and window_open:
+            elif (not panel_enabled or panel_backend != "opencv") and window_open:
                 with contextlib.suppress(Exception):
                     cv2_mod.destroyWindow(window_name)
                 camera_runtime["panel_button_rects"] = {}
@@ -2231,7 +2417,7 @@ def _camera_preview_worker(camera_runtime: dict, _device_index_unused) -> None:
                         if should_emit_vision_log(camera_runtime, now_ts=now_ts):
                             debug_text = format_vision_debug_output(raw_output, detections)
                             print(f"\n[vision-log] {debug_text}\n")
-                        if bool(camera_runtime.get("panel_enabled", False)):
+                        if panel_enabled or qt_panel_active:
                             frame = annotate_frame_with_detections(frame, detections, cv2_mod)
                 except Exception as exc:
                     print_error_red(f"ERROR: Vision inference failed: {exc}")
@@ -2275,6 +2461,36 @@ def _camera_preview_worker(camera_runtime: dict, _device_index_unused) -> None:
                 {"label": "Visual Effects", "action": "toggle_visual_effects", "active": bool(config.get("visual_effects_enabled", True))},
                 {"label": "Exit", "action": "exit_program", "active": False},
             ]
+            if qt_panel_active:
+                camera_jpeg = None
+                camera_placeholder = "Camera Off" if not bool(config.get("camera_enabled", False)) else "Waiting for camera..."
+                if frame is not None:
+                    try:
+                        preview = cv2_mod.resize(frame, (700, 616))
+                        ok, encoded = cv2_mod.imencode(".jpg", preview, [int(cv2_mod.IMWRITE_JPEG_QUALITY), 80])
+                        if ok:
+                            camera_jpeg = encoded.tobytes()
+                    except Exception:
+                        camera_jpeg = None
+                _put_latest_panel_state(
+                    camera_runtime.get("qt_panel_state_queue"),
+                    {
+                        "camera_jpeg": camera_jpeg,
+                        "camera_placeholder": camera_placeholder,
+                        "metrics": metrics,
+                        "button_specs": button_specs,
+                        "show_audio_monitor": bool(config.get("audio_monitor_enabled", False)),
+                        "face_state": face_state,
+                    },
+                )
+                qt_action_queue = camera_runtime.get("qt_panel_action_queue")
+                if qt_action_queue is not None:
+                    while True:
+                        try:
+                            action = qt_action_queue.get_nowait()
+                        except Exception:
+                            break
+                        handle_panel_action(str(action), camera_runtime)
             if panel_enabled and window_open:
                 panel_frame, rects = build_panel_frame(
                     np_mod,
@@ -2301,7 +2517,7 @@ def _camera_preview_worker(camera_runtime: dict, _device_index_unused) -> None:
                     continue
             panel_is_active = any(
                 [
-                    panel_enabled,
+                    panel_enabled or qt_panel_active,
                     cap is not None,
                     bool(config.get("audio_monitor_enabled", False)),
                     bool(config.get("vision_enabled", False)),
@@ -2368,10 +2584,11 @@ def handle_panel_action(action: str, camera_runtime: dict) -> None:
         if bool(config.get("auto_listen_enabled", False)):
             config["auto_listen_enabled"] = False
             save_robot_config(config)
-            stop_auto_listen(auto_listen_runtime)
+            refresh_auto_listen_worker(auto_listen_runtime, config)
             print("\n✅ auto_listen = off\n")
         else:
-            if start_auto_listen(auto_listen_runtime, config):
+            config["auto_listen_enabled"] = True
+            if refresh_auto_listen_worker(auto_listen_runtime, config):
                 save_robot_config(config)
                 print("\n✅ auto_listen = on\n")
         return
@@ -2406,6 +2623,12 @@ def handle_panel_action(action: str, camera_runtime: dict) -> None:
         save_robot_config(config)
         print(f"\n✅ visual_effects = {'on' if bool(config['visual_effects_enabled']) else 'off'}\n")
         return
+    if action == "close_panel":
+        camera_runtime["panel_enabled"] = False
+        if str(camera_runtime.get("panel_backend") or "").lower() == "qt":
+            stop_qt_panel(camera_runtime)
+        print("\n✅ panel = off\n")
+        return
     if action == "exit_program":
         APP_EXIT_REQUESTED.set()
         if isinstance(auto_listen_runtime, dict):
@@ -2417,6 +2640,7 @@ def handle_panel_action(action: str, camera_runtime: dict) -> None:
         stop_event = camera_runtime.get("stop_event")
         if stop_event is not None:
             stop_event.set()
+        stop_qt_panel(camera_runtime)
         print("\nExiting from panel...\n")
         with contextlib.suppress(Exception):
             _thread.interrupt_main()
@@ -3158,6 +3382,7 @@ def configure_runtime() -> None:
 HELP_TEXT = """\
 Commands:
   /help                     Show this help
+  /context                  Show the current LLM conversation memory/context
   /voices                   List native voices and select one (Windows only)
   /config                   Configure voice + Whisper STT settings
   /llm_backend <name>       Set LLM backend: local | external
@@ -3166,12 +3391,17 @@ Commands:
   /audio_inputs             List available microphone/input devices
   /audio_input_select       Select the microphone/input device for STT and auto-listen
   /audio_monitor <on|off>   Show or hide a live audio monitor window for auto-listen input
-  /panel                    Open the control panel window
+  /panel [opencv|qt]        Open the control panel window with the selected backend
   /camera <on|off>          Enable or disable camera preview
   /vision <on|off>          Enable or disable OpenVINO object detection on camera frames
   /log <on|off|seconds>     Print throttled raw vision output to the console for debugging
   /vision_events <on|off>   Enable or disable throttled vision event processing and TTS reactions
   /auto_listen <on|off>     Enable or disable continuous microphone VAD + automatic STT
+  /wake_word_enabled <t/f>  Enable or disable wake word mode
+  /wake_word_phrase <text>  Set the phrase that activates auto-listen
+  /wake_word_stop_phrase    Set the phrase that deactivates auto-listen
+  /wake_word_on_response    Set the TTS phrase spoken when wake mode activates
+  /wake_word_off_response   Set the TTS phrase spoken when wake mode deactivates
   /vad_preroll <ms>         Set pre-roll audio padding before detected speech
   /vad_silence <ms>         Set silence time before auto-listen closes a phrase
   /vad_max_segment <sec>    Set the maximum duration of a captured auto-listen phrase
@@ -3182,10 +3412,7 @@ Commands:
   /vision_device <name>     Set vision device: CPU | GPU | NPU | AUTO
   /repeat <true|false>      If true, repeats input directly with TTS (no LLM)
   /listen                   Continuous listen mode (SPACE start/stop each turn)
-  /tts_backend <name>       Set TTS backend: windows | parler | openvino | kokoro | babelvox | espeakng
-  /parler_models            List Parler model catalog and local status
-  /parler_add               Add a Parler model entry to ov_models/parler_models.json
-  /parler_select            Select Parler model id to use
+  /tts_backend <name>       Set TTS backend: windows | openvino | kokoro | babelvox | espeakng | tada
   /openvino_tts_models      List verified OpenVINO TTS models
   /openvino_tts_add         Add an OpenVINO TTS model entry
   /openvino_tts_select      Select OpenVINO TTS model id to use
@@ -3193,6 +3420,13 @@ Commands:
   /kokoro_select            Select Kokoro model id
   /babelvox_models          List BabelVox model catalog
   /babelvox_select          Select BabelVox model id
+  /tada_reference_audio     Set Hume TADA reference audio path
+  /tada_reference_text      Set Hume TADA reference transcript
+  /tada_reference_record    Record reference audio, transcribe it, and save both for TADA
+  /tada_model               Set Hume TADA HF model id
+  /tada_codec               Set Hume TADA codec/encoder HF id
+  /tada_device              Set Hume TADA device string (cpu, cuda, ...)
+  /tada_language            Set Hume TADA encoder language code
   /espeak_voices            List eSpeak NG installed voices
   /whisper_models           List Whisper OpenVINO catalog models and local status
   /whisper_add              Add a Whisper OpenVINO model entry to ov_models/whisper_models.json
@@ -3271,21 +3505,6 @@ def print_chip_fallback_warning(context: str, requested_chip: str, actual_chip: 
     )
 
 
-def build_parler_description(config: dict) -> str:
-    lang = str(config.get("parler_language", "auto")).strip().lower()
-    style = str(config.get("parler_style", "neutral")).strip().lower()
-    custom = str(config.get("parler_voice_prompt", "")).strip()
-    if lang not in PARLER_LANGUAGE_OPTIONS:
-        lang = "auto"
-    if style not in PARLER_STYLE_OPTIONS:
-        style = "neutral"
-    parts = [PARLER_LANGUAGE_HINT.get(lang, PARLER_LANGUAGE_HINT["auto"])]
-    parts.append(PARLER_STYLE_HINT.get(style, PARLER_STYLE_HINT["neutral"]))
-    if custom:
-        parts.append(custom)
-    return " ".join(parts).strip()
-
-
 def _openvino_tts_worker(model_dir: str, device: str, text: str, result_queue) -> None:
     try:
         import openvino_genai as _ov_genai
@@ -3328,6 +3547,71 @@ def ensure_kokoro_model_files(model_dir: Path) -> tuple[Path, Path]:
             str(voices_path),
         )
     return onnx_path, voices_path
+
+
+def extract_tada_audio_output(output, torch_mod, np_mod):
+    sample_rate = None
+    audio_obj = output
+    if isinstance(output, dict):
+        for key in ("audio", "waveform", "wav", "samples"):
+            if key in output and output[key] is not None:
+                audio_obj = output[key]
+                break
+        if output.get("sample_rate") is not None:
+            try:
+                sample_rate = int(output["sample_rate"])
+            except Exception:
+                sample_rate = None
+    else:
+        for attr_name in ("audio", "waveform", "wav", "samples"):
+            if hasattr(output, attr_name):
+                try:
+                    candidate = getattr(output, attr_name)
+                    if candidate is not None:
+                        audio_obj = candidate
+                        break
+                except Exception:
+                    pass
+        if hasattr(output, "sample_rate"):
+            try:
+                sample_rate = int(getattr(output, "sample_rate"))
+            except Exception:
+                sample_rate = None
+    if torch_mod is not None and hasattr(torch_mod, "Tensor") and isinstance(audio_obj, torch_mod.Tensor):
+        audio = audio_obj.detach().cpu().float().numpy()
+    else:
+        audio = np_mod.array(audio_obj, dtype=np_mod.float32)
+    if getattr(audio, "ndim", 1) > 1:
+        audio = audio.reshape(-1)
+    return np_mod.array(audio, dtype=np_mod.float32).reshape(-1), sample_rate
+
+
+def ensure_tada_huggingface_compat() -> None:
+    try:
+        import inspect
+        from huggingface_hub import utils as hf_utils
+    except Exception:
+        return
+
+    def _wrap_if_needed(attr_name: str) -> None:
+        fn = getattr(hf_utils, attr_name, None)
+        if fn is None:
+            return
+        try:
+            params = inspect.signature(fn).parameters
+        except Exception:
+            return
+        if "reason" in params:
+            return
+
+        def compat_wrapper(*args, **kwargs):
+            kwargs.pop("reason", None)
+            return fn(*args, **kwargs)
+
+        setattr(hf_utils, attr_name, compat_wrapper)
+
+    _wrap_if_needed("disable_progress_bars")
+    _wrap_if_needed("enable_progress_bars")
 
 
 def collect_benchmark_prompts(count: int = 5) -> list[str]:
@@ -3589,6 +3873,7 @@ def default_robot_config() -> dict:
         "audio_input_device": "",
         "audio_monitor_enabled": False,
         "visual_effects_enabled": True,
+        "panel_backend": "opencv",
         "camera_enabled": False,
         "camera_device_index": 0,
         "vision_enabled": False,
@@ -3601,6 +3886,11 @@ def default_robot_config() -> dict:
         "vision_log_interval_s": 1.0,
         "vision_event_processing_enabled": True,
         "auto_listen_enabled": False,
+        "wake_word_enabled": False,
+        "wake_word_phrase": "hola robot",
+        "wake_word_stop_phrase": "adios robot",
+        "wake_word_on_response": "Te escucho.",
+        "wake_word_off_response": "Modo escucha desactivado.",
         "auto_listen_aggressiveness": 3,
         "auto_listen_threshold": 0.50,
         "auto_listen_frame_ms": 32,
@@ -3627,11 +3917,6 @@ def default_robot_config() -> dict:
         "openvino_tts_isolated_gpu": True,
         "openvino_tts_speed": 1.0,
         "openvino_tts_gain": 1.0,
-        "parler_model_id": "",
-        "parler_language": "es",
-        "parler_style": "neutral",
-        "parler_voice_prompt": "A clear, natural, neutral speaking voice.",
-        "parler_sample_rate": 24000,
         "kokoro_model_id": "kokoro-tts-intel",
         "kokoro_device": "GPU",
         "kokoro_voice": "af_sarah",
@@ -3639,6 +3924,13 @@ def default_robot_config() -> dict:
         "babelvox_device": "CPU",
         "babelvox_precision": "int8",
         "babelvox_language": "es",
+        "tada_model_id": "HumeAI/tada-1b",
+        "tada_codec_id": "HumeAI/tada-codec",
+        "tada_device": "cpu",
+        "tada_language": "en",
+        "tada_reference_audio_path": "",
+        "tada_reference_text": "",
+        "tada_sample_rate": 24000,
         "espeak_voice": "es",
         "espeak_rate": 145,
         "espeak_pitch": 45,
@@ -3670,6 +3962,10 @@ def load_robot_config() -> dict:
     cfg["audio_input_device"] = str(cfg.get("audio_input_device", "")).strip()
     cfg["audio_monitor_enabled"] = bool(cfg.get("audio_monitor_enabled", False))
     cfg["visual_effects_enabled"] = bool(cfg.get("visual_effects_enabled", True))
+    panel_backend = str(cfg.get("panel_backend", "opencv")).strip().lower()
+    if panel_backend not in {"opencv", "qt"}:
+        panel_backend = "opencv"
+    cfg["panel_backend"] = panel_backend
     cfg["camera_enabled"] = bool(cfg.get("camera_enabled", False))
     try:
         cfg["camera_device_index"] = max(0, int(cfg.get("camera_device_index", 0)))
@@ -3695,6 +3991,11 @@ def load_robot_config() -> dict:
         cfg["vision_log_interval_s"] = 1.0
     cfg["vision_event_processing_enabled"] = bool(cfg.get("vision_event_processing_enabled", True))
     cfg["auto_listen_enabled"] = bool(cfg.get("auto_listen_enabled", False))
+    cfg["wake_word_enabled"] = bool(cfg.get("wake_word_enabled", False))
+    cfg["wake_word_phrase"] = str(cfg.get("wake_word_phrase", "hola robot")).strip() or "hola robot"
+    cfg["wake_word_stop_phrase"] = str(cfg.get("wake_word_stop_phrase", "adios robot")).strip() or "adios robot"
+    cfg["wake_word_on_response"] = str(cfg.get("wake_word_on_response", "Te escucho.")).strip() or "Te escucho."
+    cfg["wake_word_off_response"] = str(cfg.get("wake_word_off_response", "Modo escucha desactivado.")).strip() or "Modo escucha desactivado."
     try:
         cfg["auto_listen_aggressiveness"] = min(3, max(0, int(cfg.get("auto_listen_aggressiveness", 3))))
     except Exception:
@@ -3758,11 +4059,11 @@ def load_robot_config() -> dict:
         PLATFORM_NAME,
     )
     cfg["tts_backend"] = tts_backend
-    openvino_tts_device = str(cfg.get("openvino_tts_device", cfg.get("parler_ov_device", "AUTO"))).strip().upper()
+    openvino_tts_device = str(cfg.get("openvino_tts_device", "AUTO")).strip().upper()
     if openvino_tts_device not in PARLER_OV_DEVICE_OPTIONS:
         openvino_tts_device = "AUTO"
     cfg["openvino_tts_device"] = openvino_tts_device
-    cfg["openvino_tts_model_id"] = str(cfg.get("openvino_tts_model_id", cfg.get("parler_ov_model_id", ""))).strip()
+    cfg["openvino_tts_model_id"] = str(cfg.get("openvino_tts_model_id", "")).strip()
     try:
         cfg["openvino_tts_timeout_s"] = max(3, int(cfg.get("openvino_tts_timeout_s", 25)))
     except Exception:
@@ -3778,16 +4079,6 @@ def load_robot_config() -> dict:
     except Exception:
         cfg["openvino_tts_gain"] = 1.0
     cfg["openvino_tts_gain"] = min(3.0, max(0.1, cfg["openvino_tts_gain"]))
-    cfg["parler_model_id"] = str(cfg.get("parler_model_id", "")).strip()
-    parler_language = str(cfg.get("parler_language", "es")).strip().lower()
-    if parler_language not in PARLER_LANGUAGE_OPTIONS:
-        parler_language = "es"
-    cfg["parler_language"] = parler_language
-    parler_style = str(cfg.get("parler_style", "neutral")).strip().lower()
-    if parler_style not in PARLER_STYLE_OPTIONS:
-        parler_style = "neutral"
-    cfg["parler_style"] = parler_style
-    cfg["parler_voice_prompt"] = str(cfg.get("parler_voice_prompt", "A clear, natural, neutral speaking voice.")).strip()
     cfg["kokoro_model_id"] = str(cfg.get("kokoro_model_id", "kokoro-tts-intel")).strip()
     kokoro_device = str(cfg.get("kokoro_device", "GPU")).strip().upper()
     if kokoro_device not in KOKORO_DEVICE_OPTIONS:
@@ -3807,6 +4098,17 @@ def load_robot_config() -> dict:
     if babelvox_language not in WHISPER_LANGUAGE_OPTIONS:
         babelvox_language = "es"
     cfg["babelvox_language"] = babelvox_language
+    cfg["tada_model_id"] = str(cfg.get("tada_model_id", "HumeAI/tada-1b")).strip() or "HumeAI/tada-1b"
+    cfg["tada_codec_id"] = str(cfg.get("tada_codec_id", "HumeAI/tada-codec")).strip() or "HumeAI/tada-codec"
+    cfg["tada_device"] = str(cfg.get("tada_device", "cpu")).strip() or "cpu"
+    tada_language = str(cfg.get("tada_language", "en")).strip().lower()
+    cfg["tada_language"] = tada_language or "en"
+    cfg["tada_reference_audio_path"] = str(cfg.get("tada_reference_audio_path", "")).strip()
+    cfg["tada_reference_text"] = str(cfg.get("tada_reference_text", "")).strip()
+    try:
+        cfg["tada_sample_rate"] = max(8000, int(cfg.get("tada_sample_rate", 24000)))
+    except Exception:
+        cfg["tada_sample_rate"] = 24000
     cfg["espeak_voice"] = str(cfg.get("espeak_voice", "es")).strip() or "es"
     try:
         cfg["espeak_rate"] = int(cfg.get("espeak_rate", 145))
@@ -3823,10 +4125,6 @@ def load_robot_config() -> dict:
     except Exception:
         cfg["espeak_amplitude"] = 120
     cfg["espeak_amplitude"] = min(200, max(0, cfg["espeak_amplitude"]))
-    try:
-        cfg["parler_sample_rate"] = max(8000, int(cfg.get("parler_sample_rate", 24000)))
-    except Exception:
-        cfg["parler_sample_rate"] = 24000
     return cfg
 
 
@@ -3867,57 +4165,84 @@ def apply_voice_config(speaker, voices, config: dict) -> None:
     speaker.Voice = voices.Item(idx)
     speaker.Rate = int(config.get("rate", -2))
     speaker.Volume = int(config.get("volume", 100))
+    config["_tts_warmup_done"] = False
+
+
+def _coinit_windows_com() -> object | None:
+    if not IS_WINDOWS:
+        return None
+    try:
+        pythoncom_mod = importlib.import_module("pythoncom")
+    except Exception:
+        return None
+    try:
+        pythoncom_mod.CoInitialize()
+    except Exception:
+        return None
+    return pythoncom_mod
+
+
+def warmup_windows_tts_if_needed(speaker, config: dict) -> None:
+    if speaker is None:
+        return
+    if not bool(config.get("warmup_tts", True)):
+        return
+    if bool(config.get("_tts_warmup_done", False)):
+        return
+    warmup_xml = f'<speak><silence msec="{WINDOWS_TTS_WARMUP_SILENCE_MS}"/></speak>'
+    try:
+        speaker.Speak(warmup_xml, SAPI_SVSFISXML)
+    except Exception:
+        pass
+    finally:
+        config["_tts_warmup_done"] = True
 
 
 def speak_text(speaker, text: str, config: dict, allow_interrupt: bool = False) -> tuple[bool, float]:
     safe_text = xml_escape(text or "")
     base_silence = max(0, int(config.get("silence", 0)))
-    use_warmup = bool(config.get("warmup_tts", True))
-    if use_warmup:
-        first_tts_done = bool(config.get("_tts_warmup_done", False))
-        silence = base_silence if not first_tts_done else 0
-    else:
-        silence = base_silence
-    xml = f'<speak><silence msec="{silence}"/>{safe_text}</speak>'
-    speak_flags_async_xml = 1 | 8
-    purge_flags = 1 | 2
+    xml = f'<speak><silence msec="{base_silence}"/>{safe_text}</speak>'
     t_start = time.perf_counter()
-    with audio_playback_scope():
-        speaker.Speak(xml, speak_flags_async_xml)
-        calc_latency_s = time.perf_counter() - t_start
-        if use_warmup and not bool(config.get("_tts_warmup_done", False)):
-            config["_tts_warmup_done"] = True
+    pythoncom_mod = _coinit_windows_com()
+    try:
+        with WINDOWS_TTS_LOCK:
+            warmup_windows_tts_if_needed(speaker, config)
+            with audio_playback_scope():
+                speaker.Speak(xml, SAPI_SVSFLAGSASYNC | SAPI_SVSFISXML)
+                calc_latency_s = time.perf_counter() - t_start
 
-        if not allow_interrupt:
-            while not speaker.WaitUntilDone(50):
+                if not allow_interrupt:
+                    while not speaker.WaitUntilDone(50):
+                        pass
+                    return False, calc_latency_s
+
+                with KEYBOARD.capture():
+                    while not speaker.WaitUntilDone(50):
+                        if consume_esc_pressed() or is_audio_cancel_requested():
+                            speaker.Speak("", SAPI_SVSFPURGEBEFORESPEAK)
+                            return True, calc_latency_s
+    finally:
+        if pythoncom_mod is not None:
+            try:
+                pythoncom_mod.CoUninitialize()
+            except Exception:
                 pass
-            return False, calc_latency_s
-
-        with KEYBOARD.capture():
-            while not speaker.WaitUntilDone(50):
-                if consume_esc_pressed() or is_audio_cancel_requested():
-                    speaker.Speak("", purge_flags)
-                    return True, calc_latency_s
     return False, calc_latency_s
 
 
 def ensure_tts_runtime(tts_runtime: dict, config: dict) -> bool:
     compat = tts_runtime.get("compat")
     def release_tts_models() -> None:
-        if tts_runtime.get("parler_model") is not None:
-            try:
-                tts_runtime["parler_model"].to("cpu")
-            except Exception:
-                pass
         tts_runtime["pipeline"] = None
         tts_runtime["model_id"] = None
         tts_runtime["ov_model_dir"] = None
         tts_runtime["ov_device"] = None
-        tts_runtime["parler_model"] = None
-        tts_runtime["parler_tokenizer"] = None
         tts_runtime["torch"] = None
+        tts_runtime["torchaudio"] = None
         tts_runtime["kokoro_engine"] = None
         tts_runtime["babelvox_engine"] = None
+        tts_runtime["tada_model"] = None
+        tts_runtime["tada_encoder"] = None
         tts_runtime["backend"] = None
         tts_runtime["active_key"] = None
         gc.collect()
@@ -3945,86 +4270,6 @@ def ensure_tts_runtime(tts_runtime: dict, config: dict) -> bool:
         tts_runtime["active_key"] = ("espeakng", exe)
         print(f"✅ eSpeak NG backend active: {exe}\n")
         return True
-
-    if backend == "parler":
-        models = load_parler_ov_models()
-        selected_id = str(config.get("parler_model_id", "")).strip()
-        compat_key = f"tts:parler:{selected_id or 'unknown'}"
-        if not models:
-            print_error_red("ERROR: parler backend is enabled but no Parler models are configured.")
-            mark_runtime_chip_compat(compat, compat_key, "CPU", False)
-            return False
-
-        selected = next((m for m in models if m["id"] == selected_id), None)
-        if selected is None:
-            selected = models[0]
-            config["parler_model_id"] = selected["id"]
-            save_robot_config(config)
-        compat_key = f"tts:parler:{selected['id']}"
-
-        key = ("parler", selected["id"], "CPU")
-        if (
-            tts_runtime.get("active_key") == key
-            and tts_runtime.get("parler_model") is not None
-            and tts_runtime.get("parler_tokenizer") is not None
-        ):
-            tts_runtime["backend"] = "parler"
-            return True
-        if tts_runtime.get("active_key") is not None and tts_runtime.get("active_key") != key:
-            print("Releasing previous TTS model...")
-            release_tts_models()
-
-        try:
-            if not is_repo_downloaded(selected["local"]):
-                download_parler_ov_model(selected)
-        except Exception as exc:
-            print_error_red(f"ERROR: Failed to download Parler model: {exc}")
-            mark_runtime_chip_compat(compat, compat_key, "CPU", False)
-            return False
-
-        torch_mod = ensure_dependency("torch", "torch", "PyTorch")
-        if torch_mod is None:
-            mark_runtime_chip_compat(compat, compat_key, "CPU", False)
-            return False
-        transformers_mod = ensure_dependency("transformers", "transformers", "Transformers")
-        if transformers_mod is None:
-            mark_runtime_chip_compat(compat, compat_key, "CPU", False)
-            return False
-        parler_mod = ensure_dependency("parler_tts", "parler-tts", "Parler-TTS")
-        if parler_mod is None:
-            mark_runtime_chip_compat(compat, compat_key, "CPU", False)
-            return False
-        np_mod = ensure_dependency("numpy", "numpy", "NumPy")
-        if np_mod is None:
-            mark_runtime_chip_compat(compat, compat_key, "CPU", False)
-            return False
-        sd_mod = ensure_dependency("sounddevice", "sounddevice", "SoundDevice")
-        if sd_mod is None:
-            mark_runtime_chip_compat(compat, compat_key, "CPU", False)
-            return False
-
-        try:
-            print(f"Loading Parler model '{selected['display']}' on CPU (without OpenVINO)...")
-            tokenizer = transformers_mod.AutoTokenizer.from_pretrained(str(selected["local"]))
-            model = parler_mod.ParlerTTSForConditionalGeneration.from_pretrained(str(selected["local"]))
-            model.to("cpu")
-            model.eval()
-
-            tts_runtime["parler_model"] = model
-            tts_runtime["parler_tokenizer"] = tokenizer
-            tts_runtime["torch"] = torch_mod
-            tts_runtime["numpy"] = np_mod
-            tts_runtime["sounddevice"] = sd_mod
-            tts_runtime["model_id"] = selected["id"]
-            tts_runtime["backend"] = "parler"
-            tts_runtime["active_key"] = key
-            mark_runtime_chip_compat(compat, compat_key, "CPU", True)
-            print(f"✅ Parler model active: {selected['id']} (CPU)\n")
-            return True
-        except Exception as exc:
-            print_error_red(f"ERROR: Failed to initialize Parler backend on CPU: {exc}")
-            mark_runtime_chip_compat(compat, compat_key, "CPU", False)
-            return False
 
     if backend == "openvino":
         requested_device = str(config.get("openvino_tts_device", "AUTO")).strip().upper()
@@ -4156,7 +4401,7 @@ def ensure_tts_runtime(tts_runtime: dict, config: dict) -> bool:
 
         if not is_repo_downloaded(selected["local"]):
             try:
-                download_parler_ov_model(selected)
+                download_repo_model(selected, "Kokoro model")
             except Exception as exc:
                 print_error_red(f"ERROR: Failed to download Kokoro model: {exc}")
                 mark_runtime_chip_compat(compat, compat_key, device, False)
@@ -4286,7 +4531,7 @@ def ensure_tts_runtime(tts_runtime: dict, config: dict) -> bool:
         # so "downloaded" status and runtime cache point to the same folder.
         if not is_repo_downloaded(selected["local"]):
             try:
-                download_parler_ov_model(selected)
+                download_repo_model(selected, "BabelVox model")
             except Exception as exc:
                 print_error_red(f"ERROR: Failed to download BabelVox model: {exc}")
                 mark_runtime_chip_compat(compat, compat_key, device, False)
@@ -4344,6 +4589,102 @@ def ensure_tts_runtime(tts_runtime: dict, config: dict) -> bool:
             release_tts_models()
             return False
 
+    if backend == "tada":
+        ensure_tada_huggingface_compat()
+        hf_token = load_hf_token()
+        model_id = str(config.get("tada_model_id", "HumeAI/tada-1b")).strip() or "HumeAI/tada-1b"
+        codec_id = str(config.get("tada_codec_id", "HumeAI/tada-codec")).strip() or "HumeAI/tada-codec"
+        device = str(config.get("tada_device", "cpu")).strip() or "cpu"
+        language = str(config.get("tada_language", "en")).strip().lower() or "en"
+        reference_audio = Path(str(config.get("tada_reference_audio_path", "")).strip())
+        reference_text = str(config.get("tada_reference_text", "")).strip()
+        if not reference_audio.exists():
+            print_error_red("ERROR: TADA requires an existing reference audio file.")
+            print_error_red("ERROR: Set it with /tada_reference_audio <path> or in /config.")
+            return False
+        if not reference_text:
+            print_error_red("ERROR: TADA requires the transcript of the reference audio.")
+            print_error_red("ERROR: Set it with /tada_reference_text <text> or in /config.")
+            return False
+        key = ("tada", model_id, codec_id, device, language, str(reference_audio))
+        if (
+            tts_runtime.get("active_key") == key
+            and tts_runtime.get("tada_model") is not None
+            and tts_runtime.get("tada_encoder") is not None
+        ):
+            tts_runtime["backend"] = "tada"
+            return True
+        if tts_runtime.get("active_key") is not None and tts_runtime.get("active_key") != key:
+            print("Releasing previous TTS model...")
+            release_tts_models()
+
+        torch_mod = ensure_dependency("torch", "torch", "PyTorch")
+        if torch_mod is None:
+            return False
+        torchaudio_mod = ensure_dependency("torchaudio", "torchaudio", "TorchAudio")
+        if torchaudio_mod is None:
+            return False
+        tada_root = ensure_dependency("tada", "git+https://github.com/HumeAI/tada.git", "HumeAI TADA")
+        if tada_root is None:
+            return False
+        np_mod = ensure_dependency("numpy", "numpy", "NumPy")
+        if np_mod is None:
+            return False
+        sd_mod = ensure_dependency("sounddevice", "sounddevice", "SoundDevice")
+        if sd_mod is None:
+            return False
+        try:
+            encoder_mod = importlib.import_module("tada.modules.encoder")
+            model_mod = importlib.import_module("tada.modules.tada")
+            encoder_cls = getattr(encoder_mod, "Encoder")
+            tada_cls = getattr(model_mod, "TadaForCausalLM")
+            print(f"Loading Hume TADA model '{model_id}' on {device}...")
+            try:
+                encoder = encoder_cls.from_pretrained(codec_id, language=language, token=hf_token)
+            except TypeError:
+                try:
+                    encoder = encoder_cls.from_pretrained(codec_id, language=language, use_auth_token=hf_token)
+                except TypeError:
+                    encoder = encoder_cls.from_pretrained(codec_id)
+            try:
+                model = tada_cls.from_pretrained(model_id, token=hf_token)
+            except TypeError:
+                try:
+                    model = tada_cls.from_pretrained(model_id, use_auth_token=hf_token)
+                except TypeError:
+                    model = tada_cls.from_pretrained(model_id)
+            if hasattr(encoder, "to"):
+                encoder = encoder.to(device)
+            if hasattr(model, "to"):
+                model = model.to(device)
+            if hasattr(model, "eval"):
+                model.eval()
+            tts_runtime["tada_model"] = model
+            tts_runtime["tada_encoder"] = encoder
+            tts_runtime["torch"] = torch_mod
+            tts_runtime["torchaudio"] = torchaudio_mod
+            tts_runtime["numpy"] = np_mod
+            tts_runtime["sounddevice"] = sd_mod
+            tts_runtime["model_id"] = model_id
+            tts_runtime["backend"] = "tada"
+            tts_runtime["active_key"] = key
+            print(f"✅ Hume TADA backend active: {model_id} ({device})\n")
+            return True
+        except Exception as exc:
+            print_error_red(f"ERROR: Failed to initialize Hume TADA backend: {exc}")
+            http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+            https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+            if http_proxy or https_proxy:
+                print_error_red(
+                    f"ERROR: Proxy env detected. HTTP_PROXY={http_proxy!r} HTTPS_PROXY={https_proxy!r}"
+                )
+                print_error_red("ERROR: If those proxies are invalid, TADA model download from Hugging Face will fail.")
+            if hf_token:
+                print_error_red("ERROR: HF token is present, so if this still says 'gated repo', your account likely does not have access approved for that model.")
+            print_error_red("ERROR: TADA needs a valid reference audio and transcript, and the Hugging Face assets may require access.")
+            release_tts_models()
+            return False
+
     print_error_red(f"ERROR: Unsupported TTS backend: {backend}")
     return False
 
@@ -4373,22 +4714,7 @@ def speak_text_backend(
             t_start = time.perf_counter()
             np_mod = tts_runtime["numpy"]
             sd_mod = tts_runtime["sounddevice"]
-            if backend == "parler":
-                voice_prompt = build_parler_description(config)
-                tokenizer = tts_runtime["parler_tokenizer"]
-                model = tts_runtime["parler_model"]
-                torch_mod = tts_runtime["torch"]
-                description_ids = tokenizer(
-                    voice_prompt or "Use the language that best matches the input text. Use a neutral speaking style.",
-                    return_tensors="pt",
-                ).input_ids
-                prompt_ids = tokenizer(text, return_tensors="pt").input_ids
-                with torch_mod.no_grad():
-                    audio_tensor = model.generate(input_ids=description_ids, prompt_input_ids=prompt_ids)
-                calc_latency_s = time.perf_counter() - t_start
-                audio = audio_tensor.cpu().numpy().squeeze().astype(np_mod.float32)
-                sample_rate = int(getattr(model.config, "sampling_rate", config.get("parler_sample_rate", 24000)))
-            elif backend == "openvino":
+            if backend == "openvino":
                 timeout_s = int(config.get("openvino_tts_timeout_s", 25))
                 device = str(config.get("openvino_tts_device", "AUTO")).strip().upper()
                 isolated_gpu = bool(config.get("openvino_tts_isolated_gpu", True))
@@ -4457,7 +4783,7 @@ def speak_text_backend(
                         audio = np_mod.array(audio_obj.data, dtype=np_mod.float32).reshape(-1)
                     else:
                         audio = np_mod.array(audio_obj, dtype=np_mod.float32).reshape(-1)
-                sample_rate = int(config.get("parler_sample_rate", 24000))
+                sample_rate = 24000
                 audio = apply_openvino_tts_postprocess(audio, np_mod, config)
             elif backend == "kokoro":
                 engine = tts_runtime.get("kokoro_engine")
@@ -4475,7 +4801,7 @@ def speak_text_backend(
                 }.get(lang_code, "en-us")
                 output = engine.create(text, voice=voice, speed=1.0, lang=kokoro_lang)
                 calc_latency_s = time.perf_counter() - t_start
-                sample_rate = int(config.get("parler_sample_rate", 24000))
+                sample_rate = 24000
                 if isinstance(output, tuple) and len(output) >= 2:
                     audio_raw = output[0]
                     try:
@@ -4498,6 +4824,40 @@ def speak_text_backend(
                 wav, sample_rate = engine.generate(text, language=language)
                 calc_latency_s = time.perf_counter() - t_start
                 audio = np_mod.array(wav, dtype=np_mod.float32).reshape(-1)
+            elif backend == "tada":
+                model = tts_runtime.get("tada_model")
+                encoder = tts_runtime.get("tada_encoder")
+                torch_mod = tts_runtime.get("torch")
+                torchaudio_mod = tts_runtime.get("torchaudio")
+                if model is None or encoder is None or torch_mod is None or torchaudio_mod is None:
+                    raise RuntimeError("TADA runtime not initialized.")
+                reference_path = Path(str(config.get("tada_reference_audio_path", "")).strip())
+                reference_text = str(config.get("tada_reference_text", "")).strip()
+                if not reference_path.exists():
+                    raise RuntimeError("TADA reference audio file does not exist.")
+                if not reference_text:
+                    raise RuntimeError("TADA reference transcript is empty.")
+                waveform, ref_sample_rate = torchaudio_mod.load(str(reference_path))
+                if getattr(waveform, "dim", lambda: 0)() == 1:
+                    waveform = waveform.unsqueeze(0)
+                if hasattr(waveform, "to"):
+                    waveform = waveform.to(str(config.get("tada_device", "cpu")).strip() or "cpu")
+                prompt_kwargs = {"sample_rate": int(ref_sample_rate)}
+                if reference_text:
+                    prompt_kwargs["text"] = [reference_text]
+                with torch_mod.no_grad():
+                    try:
+                        prompt = encoder(waveform, **prompt_kwargs)
+                    except TypeError:
+                        prompt_kwargs["text"] = reference_text
+                        prompt = encoder(waveform, **prompt_kwargs)
+                    try:
+                        output = model.generate(prompt=prompt, text=text)
+                    except TypeError:
+                        output = model.generate(prompt=prompt, text=[text])
+                calc_latency_s = time.perf_counter() - t_start
+                audio, detected_sample_rate = extract_tada_audio_output(output, torch_mod, np_mod)
+                sample_rate = int(detected_sample_rate or config.get("tada_sample_rate", 24000))
             else:
                 print_error_red(f"ERROR: Unsupported TTS backend: {backend}")
                 return False, 0.0
@@ -5103,6 +5463,46 @@ def transcribe_audio_buffer(stt_runtime: dict, config: dict, audio, speech_end_t
     return text, speech_end_to_text_s
 
 
+def save_float_audio_to_wav(path: Path, audio, sample_rate: int, np_mod) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = np_mod.array(audio, dtype=np_mod.float32).reshape(-1)
+    if getattr(data, "size", 0) == 0:
+        raise ValueError("Cannot save empty audio.")
+    clipped = np_mod.clip(data, -1.0, 1.0)
+    pcm16 = (clipped * 32767.0).astype(np_mod.int16)
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(int(sample_rate))
+        wav_file.writeframes(pcm16.tobytes())
+
+
+def capture_tada_reference_from_mic(stt_runtime: dict, config: dict, sample_rate: int = 16000) -> tuple[Path | None, str]:
+    if not ensure_stt_runtime(stt_runtime, config):
+        return None, ""
+    np_mod = stt_runtime["numpy"]
+    sd_mod = stt_runtime["sounddevice"]
+    device = resolve_audio_input_device(config, sd_mod)
+    print("\nTADA reference capture")
+    print("Speak with your normal voice and press SPACE to stop.\n")
+    audio, speech_end_ts = record_until_space(sd_mod, np_mod, sample_rate=sample_rate, device=device)
+    if getattr(audio, "size", 0) == 0:
+        print("\n⚠️ No audio captured.\n")
+        return None, ""
+    text, _stt_time = transcribe_audio_buffer(stt_runtime, config, audio, speech_end_ts=speech_end_ts)
+    if not text:
+        print("\n⚠️ Could not derive a reference transcript from the recording.\n")
+        return None, ""
+    target_path = CACHE_DIR / "tada_reference.wav"
+    save_float_audio_to_wav(target_path, audio, sample_rate, np_mod)
+    config["tada_reference_audio_path"] = str(target_path)
+    config["tada_reference_text"] = text
+    save_robot_config(config)
+    print(f"✅ TADA reference audio saved: {target_path}")
+    print("✅ TADA reference transcript updated.\n")
+    return target_path, text
+
+
 def process_auto_listen_text(
     text: str,
     llm_state: dict,
@@ -5146,6 +5546,88 @@ def is_valid_auto_listen_transcript(text: str) -> bool:
     if len(words) >= 4:
         return True
     return "hola" in words
+
+
+def spoken_phrase_to_words(text: str) -> list[str]:
+    raw_words = re.split(r"[\s,.;:!?¡¿()\[\]{}\"“”'`´\-_/\\]+", str(text or "").strip().lower())
+    words: list[str] = []
+    for raw in raw_words:
+        cleaned = "".join(ch for ch in raw if ch.isalnum())
+        if not cleaned:
+            continue
+        normalized = unicodedata.normalize("NFKD", cleaned)
+        without_accents = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+        if without_accents:
+            words.append(without_accents)
+    return words
+
+
+def transcript_matches_phrase(text: str, phrase: str) -> bool:
+    text_words = spoken_phrase_to_words(text)
+    phrase_words = spoken_phrase_to_words(phrase)
+    if not text_words or not phrase_words:
+        return False
+    return text_words == phrase_words
+
+
+def should_run_auto_listen_worker(config: dict) -> bool:
+    return bool(config.get("auto_listen_enabled", False) or config.get("wake_word_enabled", False))
+
+
+def speak_wake_word_response(
+    message: str,
+    speaker,
+    config: dict,
+    tts_runtime: dict,
+) -> None:
+    if not message:
+        return
+    if not bool(config.get("audio_enabled", True)):
+        return
+    try:
+        speak_text_backend(
+            speaker,
+            str(message),
+            config,
+            tts_runtime,
+            allow_interrupt=True,
+        )
+    except Exception as exc:
+        print_error_red(f"ERROR: Wake word TTS failed: {exc}")
+
+
+def handle_wake_word_transcript(
+    text: str,
+    auto_listen_runtime: dict,
+    speaker,
+    config: dict,
+    tts_runtime: dict,
+) -> bool:
+    if not bool(config.get("wake_word_enabled", False)):
+        return False
+    wake_phrase = str(config.get("wake_word_phrase", "hola robot")).strip()
+    stop_phrase = str(config.get("wake_word_stop_phrase", "adios robot")).strip()
+    auto_active = bool(config.get("auto_listen_enabled", False))
+    if not auto_active:
+        if transcript_matches_phrase(text, wake_phrase):
+            config["auto_listen_enabled"] = True
+            save_robot_config(config)
+            print(f"[wake-word] activated by: {text}\n")
+            speak_wake_word_response(str(config.get("wake_word_on_response", "Te escucho.")).strip(), speaker, config, tts_runtime)
+            return True
+        return True
+    if transcript_matches_phrase(text, stop_phrase):
+        config["auto_listen_enabled"] = False
+        save_robot_config(config)
+        print(f"[wake-word] deactivated by: {text}\n")
+        speak_wake_word_response(
+            str(config.get("wake_word_off_response", "Modo escucha desactivado.")).strip(),
+            speaker,
+            config,
+            tts_runtime,
+        )
+        return True
+    return False
 
 
 def _reset_vad_segment_state(state: dict) -> None:
@@ -5447,7 +5929,7 @@ def _auto_listen_worker(auto_listen_runtime: dict) -> None:
             callback=callback,
         ):
             while not stop_event.is_set():
-                if not bool(config.get("auto_listen_enabled", False)):
+                if not should_run_auto_listen_worker(config):
                     time.sleep(0.05)
                     continue
                 if is_tts_blocking_auto_listen(config):
@@ -5545,6 +6027,8 @@ def _auto_listen_worker(auto_listen_runtime: dict) -> None:
                 if bool(config.get("vision_log_enabled", False)):
                     print(f"\n[vad-log] segment accepted: {len(audio) / sample_rate:0.2f}s\n")
                 text, _stt_time = transcribe_audio_buffer(stt_runtime, config, audio, speech_end_ts=time.perf_counter())
+                if text and handle_wake_word_transcript(text, auto_listen_runtime, speaker, config, tts_runtime):
+                    continue
                 if text and not is_valid_auto_listen_transcript(text):
                     if bool(config.get("vision_log_enabled", False)):
                         print(f"\n[vad-log] transcript ignored: {text!r}\n")
@@ -5569,11 +6053,11 @@ def stop_auto_listen(auto_listen_runtime: dict) -> None:
     auto_listen_runtime["stop_event"] = None
 
 
-def start_auto_listen(auto_listen_runtime: dict, config: dict) -> bool:
+def start_auto_listen(auto_listen_runtime: dict, config: dict, activate_session: bool = True) -> bool:
     stop_auto_listen(auto_listen_runtime)
     if not prepare_auto_listen_runtime(auto_listen_runtime, config):
         return False
-    config["auto_listen_enabled"] = True
+    config["auto_listen_enabled"] = bool(activate_session)
     auto_listen_runtime["voice_config"] = config
     if bool(config.get("audio_monitor_enabled", False)):
         start_audio_monitor(auto_listen_runtime)
@@ -5582,6 +6066,20 @@ def start_auto_listen(auto_listen_runtime: dict, config: dict) -> bool:
     thread = threading.Thread(target=_auto_listen_worker, args=(auto_listen_runtime,), daemon=True)
     auto_listen_runtime["thread"] = thread
     thread.start()
+    return True
+
+
+def refresh_auto_listen_worker(auto_listen_runtime: dict, config: dict) -> bool:
+    if should_run_auto_listen_worker(config):
+        thread = auto_listen_runtime.get("thread")
+        if thread is not None and thread.is_alive():
+            return True
+        return start_auto_listen(
+            auto_listen_runtime,
+            config,
+            activate_session=bool(config.get("auto_listen_enabled", False)),
+        )
+    stop_auto_listen(auto_listen_runtime)
     return True
 
 
@@ -5719,9 +6217,6 @@ def show_voice_config(config: dict, speaker) -> None:
     print(f"  volume  : {config.get('volume', 100)}")
     print(f"  silence : {config.get('silence', 600)}")
     print(f"  tts_backend: {config.get('tts_backend', DEFAULT_TTS_BACKEND)}")
-    print(f"  parler_model_id: {config.get('parler_model_id', '') or '(none)'}")
-    print(f"  parler_language: {config.get('parler_language', 'es')}")
-    print(f"  parler_style: {config.get('parler_style', 'neutral')}")
     print(f"  openvino_tts_device: {config.get('openvino_tts_device', 'AUTO')}")
     print(f"  openvino_tts_model_id: {config.get('openvino_tts_model_id', '') or '(none)'}")
     print(f"  openvino_tts_timeout_s: {int(config.get('openvino_tts_timeout_s', 25))}")
@@ -5735,11 +6230,17 @@ def show_voice_config(config: dict, speaker) -> None:
     print(f"  babelvox_device: {config.get('babelvox_device', 'CPU')}")
     print(f"  babelvox_precision: {config.get('babelvox_precision', 'int8')}")
     print(f"  babelvox_language: {config.get('babelvox_language', 'es')}")
+    print(f"  tada_model_id: {config.get('tada_model_id', 'HumeAI/tada-1b')}")
+    print(f"  tada_codec_id: {config.get('tada_codec_id', 'HumeAI/tada-codec')}")
+    print(f"  tada_device: {config.get('tada_device', 'cpu')}")
+    print(f"  tada_language: {config.get('tada_language', 'en')}")
+    print(f"  tada_reference_audio_path: {config.get('tada_reference_audio_path', '') or '(empty)'}")
+    print(f"  tada_reference_text: {'(set)' if str(config.get('tada_reference_text', '')).strip() else '(empty)'}")
+    print(f"  tada_sample_rate: {int(config.get('tada_sample_rate', 24000))}")
     print(f"  espeak_voice: {config.get('espeak_voice', 'es')}")
     print(f"  espeak_rate: {int(config.get('espeak_rate', 145))}")
     print(f"  espeak_pitch: {int(config.get('espeak_pitch', 45))}")
     print(f"  espeak_amplitude: {int(config.get('espeak_amplitude', 120))}")
-    print(f"  parler_sample_rate: {int(config.get('parler_sample_rate', 24000))}")
     print(f"  whisper : {config.get('whisper_model', DEFAULT_WHISPER_MODEL)}")
     print(f"  whisper_language: {config.get('whisper_language', 'es')}")
     print(f"  whisper_openvino: {bool(config.get('whisper_openvino', False))}")
@@ -5754,6 +6255,7 @@ def show_voice_config(config: dict, speaker) -> None:
     print(f"  audio_input_device: {config.get('audio_input_device', '') or '(default)'}")
     print(f"  audio_monitor_enabled: {bool(config.get('audio_monitor_enabled', False))}")
     print(f"  visual_effects_enabled: {bool(config.get('visual_effects_enabled', True))}")
+    print(f"  panel_backend: {config.get('panel_backend', 'opencv')}")
     print(f"  camera_enabled: {bool(config.get('camera_enabled', False))}")
     print(f"  camera_device_index: {int(config.get('camera_device_index', 0))}")
     print(f"  vision_enabled: {bool(config.get('vision_enabled', False))}")
@@ -5766,6 +6268,11 @@ def show_voice_config(config: dict, speaker) -> None:
     print(f"  vision_log_interval_s: {float(config.get('vision_log_interval_s', 1.0)):.1f}")
     print(f"  vision_event_processing_enabled: {bool(config.get('vision_event_processing_enabled', True))}")
     print(f"  auto_listen_enabled: {bool(config.get('auto_listen_enabled', False))}")
+    print(f"  wake_word_enabled: {bool(config.get('wake_word_enabled', False))}")
+    print(f"  wake_word_phrase: {config.get('wake_word_phrase', 'hola robot')}")
+    print(f"  wake_word_stop_phrase: {config.get('wake_word_stop_phrase', 'adios robot')}")
+    print(f"  wake_word_on_response: {config.get('wake_word_on_response', 'Te escucho.')}")
+    print(f"  wake_word_off_response: {config.get('wake_word_off_response', 'Modo escucha desactivado.')}")
     print(f"  auto_listen_threshold: {float(config.get('auto_listen_threshold', 0.50)):.2f}")
     print(f"  auto_listen_frame_ms: {int(config.get('auto_listen_frame_ms', 32))}")
     print(f"  auto_listen_resume_delay_ms: {int(config.get('auto_listen_resume_delay_ms', 1500))}")
@@ -5795,11 +6302,12 @@ def configure_voice_and_stt(
 ) -> None:
     print("\nConfig options:")
     print(
-        "  rate, volume, silence, tts_backend, parler_model, parler_models, parler_language, parler_style, parler_prompt, "
+        "  rate, volume, silence, tts_backend, "
         "openvino_tts_device, openvino_tts_model, openvino_tts_models, openvino_tts_timeout, openvino_tts_isolated_gpu, "
         "openvino_tts_speed, openvino_tts_gain, "
         "kokoro_model, kokoro_models, kokoro_device, kokoro_voice, "
         "babelvox_model, babelvox_models, babelvox_device, babelvox_precision, babelvox_language, "
+        "tada_model, tada_codec, tada_device, tada_language, tada_reference_audio, tada_reference_text, tada_reference_record, "
         "espeak_voices, espeak_voice, espeak_rate, espeak_pitch, espeak_amplitude, "
         "whisper, whisper_language, whisper_backend, whisper_ov_device, whisper_ov_model, whisper_ov_models, "
         "llm_backend, external_llm_base_url, external_llm_model, external_llm_api_key, "
@@ -5847,85 +6355,16 @@ def configure_voice_and_stt(
             show_voice_config(config, speaker)
             continue
         if key == "tts_backend":
-            value = input("Set TTS backend (windows|parler|openvino|kokoro|babelvox|espeakng): ").strip().lower()
+            value = input("Set TTS backend (windows|openvino|kokoro|babelvox|espeakng|tada): ").strip().lower()
             if value not in TTS_BACKEND_OPTIONS:
                 print(f"Invalid value. Use one of: {', '.join(TTS_BACKEND_OPTIONS)}")
                 continue
             config["tts_backend"] = value
             save_robot_config(config)
             tts_runtime["active_key"] = None
-            if value in {"parler", "openvino", "kokoro", "babelvox", "espeakng"}:
+            if value in {"openvino", "kokoro", "babelvox", "espeakng", "tada"}:
                 ensure_tts_runtime(tts_runtime, config)
             print(f"tts_backend updated to {value}")
-            continue
-        if key == "parler_models":
-            models = load_parler_ov_models()
-            list_parler_ov_models(models, str(config.get("parler_model_id", "")).strip())
-            continue
-        if key == "parler_model":
-            models = load_parler_ov_models()
-            selected_id = str(config.get("parler_model_id", "")).strip()
-            selected = choose_parler_ov_model_interactive(models, selected_id=selected_id, allow_download=False)
-            if selected is None:
-                print("Cancelled.")
-                continue
-            config["parler_model_id"] = selected["id"]
-            save_robot_config(config)
-            tts_runtime["active_key"] = None
-            if str(config.get("tts_backend", DEFAULT_TTS_BACKEND)).lower() == "parler":
-                ensure_tts_runtime(tts_runtime, config)
-            print(f"parler_model updated to {selected['id']}")
-            continue
-        if key == "parler_language":
-            print("\nParler language options:\n")
-            current_lang = str(config.get("parler_language", "es")).strip().lower()
-            for i, option in enumerate(PARLER_LANGUAGE_OPTIONS):
-                marker = " (current)" if option == current_lang else ""
-                print(f"  {i}) {option}{marker}")
-            value = input("\nChoose language number or code (e.g. es, en, auto): ").strip().lower()
-            if value == "cancel":
-                continue
-            if value.isdigit() and 0 <= int(value) < len(PARLER_LANGUAGE_OPTIONS):
-                lang = PARLER_LANGUAGE_OPTIONS[int(value)]
-            else:
-                lang = value
-            if lang not in PARLER_LANGUAGE_OPTIONS:
-                print(f"Invalid language. Use one of: {', '.join(PARLER_LANGUAGE_OPTIONS)}")
-                continue
-            config["parler_language"] = lang
-            save_robot_config(config)
-            print(f"parler_language updated to {lang}")
-            continue
-        if key == "parler_style":
-            print("\nParler style options:\n")
-            current_style = str(config.get("parler_style", "neutral")).strip().lower()
-            for i, option in enumerate(PARLER_STYLE_OPTIONS):
-                marker = " (current)" if option == current_style else ""
-                print(f"  {i}) {option}{marker}")
-            value = input("\nChoose style number or name: ").strip().lower()
-            if value == "cancel":
-                continue
-            if value.isdigit() and 0 <= int(value) < len(PARLER_STYLE_OPTIONS):
-                style = PARLER_STYLE_OPTIONS[int(value)]
-            else:
-                style = value
-            if style not in PARLER_STYLE_OPTIONS:
-                print(f"Invalid style. Use one of: {', '.join(PARLER_STYLE_OPTIONS)}")
-                continue
-            config["parler_style"] = style
-            save_robot_config(config)
-            print(f"parler_style updated to {style}")
-            continue
-        if key == "parler_prompt":
-            print("\nCurrent Parler custom prompt:")
-            current_prompt = str(config.get("parler_voice_prompt", "")).strip()
-            print(current_prompt if current_prompt else "(empty)")
-            new_prompt = input("\nNew Parler custom prompt (or 'cancel'): ").strip()
-            if new_prompt.lower() == "cancel":
-                continue
-            config["parler_voice_prompt"] = new_prompt
-            save_robot_config(config)
-            print("parler_prompt updated.")
             continue
         if key == "openvino_tts_models":
             models = load_ov_tts_models()
@@ -6135,6 +6574,78 @@ def configure_voice_and_stt(
             config["babelvox_language"] = lang
             save_robot_config(config)
             print(f"babelvox_language updated to {lang}")
+            continue
+        if key == "tada_model":
+            value = input("Set Hume TADA model id (e.g. HumeAI/tada-1b): ").strip()
+            if not value:
+                print("tada_model cannot be empty.")
+                continue
+            config["tada_model_id"] = value
+            save_robot_config(config)
+            tts_runtime["active_key"] = None
+            if str(config.get("tts_backend", DEFAULT_TTS_BACKEND)).lower() == "tada":
+                ensure_tts_runtime(tts_runtime, config)
+            print(f"tada_model updated to {value}")
+            continue
+        if key == "tada_codec":
+            value = input("Set Hume TADA codec id (e.g. HumeAI/tada-codec): ").strip()
+            if not value:
+                print("tada_codec cannot be empty.")
+                continue
+            config["tada_codec_id"] = value
+            save_robot_config(config)
+            tts_runtime["active_key"] = None
+            if str(config.get("tts_backend", DEFAULT_TTS_BACKEND)).lower() == "tada":
+                ensure_tts_runtime(tts_runtime, config)
+            print(f"tada_codec updated to {value}")
+            continue
+        if key == "tada_device":
+            value = input("Set Hume TADA device string (cpu, cuda, ...): ").strip()
+            if not value:
+                print("tada_device cannot be empty.")
+                continue
+            config["tada_device"] = value
+            save_robot_config(config)
+            tts_runtime["active_key"] = None
+            if str(config.get("tts_backend", DEFAULT_TTS_BACKEND)).lower() == "tada":
+                ensure_tts_runtime(tts_runtime, config)
+            print(f"tada_device updated to {value}")
+            continue
+        if key == "tada_language":
+            value = input("Set Hume TADA encoder language code (e.g. en, es): ").strip().lower()
+            if not value:
+                print("tada_language cannot be empty.")
+                continue
+            config["tada_language"] = value
+            save_robot_config(config)
+            tts_runtime["active_key"] = None
+            if str(config.get("tts_backend", DEFAULT_TTS_BACKEND)).lower() == "tada":
+                ensure_tts_runtime(tts_runtime, config)
+            print(f"tada_language updated to {value}")
+            continue
+        if key == "tada_reference_audio":
+            value = input("Set Hume TADA reference audio path: ").strip()
+            if not value:
+                print("tada_reference_audio cannot be empty.")
+                continue
+            config["tada_reference_audio_path"] = value
+            save_robot_config(config)
+            tts_runtime["active_key"] = None
+            print(f"tada_reference_audio updated to {value}")
+            continue
+        if key == "tada_reference_text":
+            value = input("Set Hume TADA reference transcript: ").strip()
+            if not value:
+                print("tada_reference_text cannot be empty.")
+                continue
+            config["tada_reference_text"] = value
+            save_robot_config(config)
+            tts_runtime["active_key"] = None
+            print("tada_reference_text updated.")
+            continue
+        if key == "tada_reference_record":
+            capture_tada_reference_from_mic(stt_runtime, config)
+            tts_runtime["active_key"] = None
             continue
         if key == "espeak_voices":
             list_espeak_voices()
@@ -6726,7 +7237,7 @@ def run_chat_turn(
             if show_roundtrip_lines:
                 print("⏱️ text -> audio: skipped (audio off)")
 
-        history.append("Assistant: (answer shown above)")
+        history.append(f"Assistant: {answer}")
         return True
     finally:
         if response_audio_activity_started:
@@ -6757,9 +7268,6 @@ def print_startup_summary(current, voice_config: dict) -> None:
         ("Whisper OV device", str(voice_config.get("whisper_openvino_device", "AUTO"))),
         ("Whisper OV model", str(voice_config.get("whisper_openvino_model_id", "")) or "(none)"),
         ("TTS backend", str(voice_config.get("tts_backend", DEFAULT_TTS_BACKEND))),
-        ("Parler model", str(voice_config.get("parler_model_id", "")) or "(none)"),
-        ("Parler language", str(voice_config.get("parler_language", "es"))),
-        ("Parler style", str(voice_config.get("parler_style", "neutral"))),
         ("OpenVINO TTS device", str(voice_config.get("openvino_tts_device", "AUTO"))),
         ("OpenVINO TTS model", str(voice_config.get("openvino_tts_model_id", "")) or "(none)"),
         ("OpenVINO TTS timeout", f"{int(voice_config.get('openvino_tts_timeout_s', 25))}s"),
@@ -6773,11 +7281,15 @@ def print_startup_summary(current, voice_config: dict) -> None:
         ("BabelVox device", str(voice_config.get("babelvox_device", "CPU"))),
         ("BabelVox precision", str(voice_config.get("babelvox_precision", "int8"))),
         ("BabelVox language", str(voice_config.get("babelvox_language", "es"))),
+        ("TADA model", str(voice_config.get("tada_model_id", "HumeAI/tada-1b"))),
+        ("TADA codec", str(voice_config.get("tada_codec_id", "HumeAI/tada-codec"))),
+        ("TADA device", str(voice_config.get("tada_device", "cpu"))),
+        ("TADA language", str(voice_config.get("tada_language", "en"))),
+        ("TADA ref audio", str(voice_config.get("tada_reference_audio_path", "")) or "(none)"),
         ("eSpeak voice", str(voice_config.get("espeak_voice", "es"))),
         ("eSpeak rate", str(int(voice_config.get("espeak_rate", 145)))),
         ("eSpeak pitch", str(int(voice_config.get("espeak_pitch", 45)))),
         ("eSpeak amplitude", str(int(voice_config.get("espeak_amplitude", 120)))),
-        ("Parler sample rate", str(int(voice_config.get("parler_sample_rate", 24000)))),
         ("Max tokens", str(int(voice_config.get("max_new_tokens", 300)))),
         ("Rate", str(voice_config.get("rate", -2))),
         ("Volume", str(voice_config.get("volume", 100))),
@@ -6787,6 +7299,7 @@ def print_startup_summary(current, voice_config: dict) -> None:
         ("Audio Input", str(voice_config.get("audio_input_device", "")) or "(default)"),
         ("Audio Monitor", str(bool(voice_config.get("audio_monitor_enabled", False)))),
         ("Visual Effects", str(bool(voice_config.get("visual_effects_enabled", True)))),
+        ("Panel backend", str(voice_config.get("panel_backend", "opencv"))),
         ("Camera", "on" if bool(voice_config.get("camera_enabled", False)) else "off"),
         ("Camera Device", str(int(voice_config.get("camera_device_index", 0)))),
         ("Vision", "on" if bool(voice_config.get("vision_enabled", False)) else "off"),
@@ -6798,6 +7311,7 @@ def print_startup_summary(current, voice_config: dict) -> None:
         ("Vision Log Interval", f"{float(voice_config.get('vision_log_interval_s', 1.0)):.1f}s"),
         ("Vision Events", str(bool(voice_config.get("vision_event_processing_enabled", True)))),
         ("Auto Listen", str(bool(voice_config.get("auto_listen_enabled", False)))),
+        ("Wake Word", str(bool(voice_config.get("wake_word_enabled", False)))),
         ("VAD Threshold", f"{float(voice_config.get('auto_listen_threshold', 0.50)):.2f}"),
         ("VAD Frame", f"{int(voice_config.get('auto_listen_frame_ms', 32))}ms"),
         ("VAD Resume Delay", f"{int(voice_config.get('auto_listen_resume_delay_ms', 1500))}ms"),
@@ -6862,10 +7376,6 @@ def print_all_models_summary(compat: dict) -> None:
     for m in load_ov_tts_models():
         if is_downloaded(m["local"]):
             rows.append(("TTS OpenVINO", m["display"], f"tts:openvino:{m['id']}"))
-
-    for m in load_parler_ov_models():
-        if is_repo_downloaded(m["local"]):
-            rows.append(("TTS Parler", m["display"], f"tts:parler:{m['id']}"))
 
     for m in load_kokoro_models():
         if is_repo_downloaded(m["local"]):
@@ -6934,11 +7444,12 @@ def main() -> None:
         "ov_device": None,
         "numpy": None,
         "sounddevice": None,
-        "parler_model": None,
-        "parler_tokenizer": None,
         "kokoro_engine": None,
         "babelvox_engine": None,
+        "tada_model": None,
+        "tada_encoder": None,
         "torch": None,
+        "torchaudio": None,
         "compat": compat,
     }
     speaker = None
@@ -6950,7 +7461,12 @@ def main() -> None:
         "vision_event_queue": None,
         "stop_event": None,
         "panel_enabled": False,
+        "panel_backend": None,
         "active_device_index": None,
+        "qt_panel_process": None,
+        "qt_panel_state_queue": None,
+        "qt_panel_action_queue": None,
+        "qt_panel_stop_event": None,
         "speaker": speaker,
         "voice_config": voice_config,
         "tts_runtime": tts_runtime,
@@ -7074,10 +7590,24 @@ def main() -> None:
                 print("\n" + HELP_TEXT)
                 continue
 
-            if cmd == "panel":
-                if start_camera_panel(camera_runtime, voice_config):
-                    print("\n✅ panel = on\n")
-                    print("Use ESC or q in the panel window to close it.\n")
+            if cmd == "context":
+                show_llm_context(history, voice_config)
+                continue
+
+            if cmd.startswith("panel"):
+                parts = cmd.split(maxsplit=1)
+                selected_backend = str(voice_config.get("panel_backend", "opencv")).strip().lower()
+                if len(parts) == 2:
+                    selected_backend = parts[1].strip().lower()
+                if selected_backend not in {"opencv", "qt"}:
+                    print("\n⚠️ Use /panel opencv|qt\n")
+                    continue
+                if start_camera_panel(camera_runtime, voice_config, backend=selected_backend):
+                    print(f"\n✅ panel = on | backend = {selected_backend}\n")
+                    if selected_backend == "opencv":
+                        print("Use ESC or q in the panel window to close it.\n")
+                    else:
+                        print("Close the Qt window to hide the panel.\n")
                 continue
 
             if cmd == "voices":
@@ -7143,7 +7673,7 @@ def main() -> None:
                 if len(parts) != 2:
                     current_tts = str(voice_config.get("tts_backend", DEFAULT_TTS_BACKEND))
                     print(f"\nTTS backend is currently: {current_tts}")
-                    print("Usage: /tts_backend windows|parler|openvino|kokoro|babelvox|espeakng\n")
+                    print("Usage: /tts_backend windows|openvino|kokoro|babelvox|espeakng|tada\n")
                     continue
                 value = parts[1].strip().lower()
                 if value not in TTS_BACKEND_OPTIONS:
@@ -7152,9 +7682,100 @@ def main() -> None:
                 voice_config["tts_backend"] = value
                 save_robot_config(voice_config)
                 tts_runtime["active_key"] = None
-                if value in {"parler", "openvino", "kokoro", "babelvox", "espeakng"}:
+                if value in {"openvino", "kokoro", "babelvox", "espeakng", "tada"}:
                     ensure_tts_runtime(tts_runtime, voice_config)
                 print(f"\n✅ tts_backend = {value}\n")
+                continue
+
+            if cmd.startswith("tada_reference_audio"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    current_value = str(voice_config.get("tada_reference_audio_path", "")).strip()
+                    print(f"\nTADA reference audio is currently: {current_value or '(empty)'}")
+                    print("Usage: /tada_reference_audio <path>\n")
+                    continue
+                voice_config["tada_reference_audio_path"] = parts[1].strip()
+                save_robot_config(voice_config)
+                tts_runtime["active_key"] = None
+                print(f"\n✅ tada_reference_audio_path = {voice_config['tada_reference_audio_path']}\n")
+                continue
+
+            if cmd.startswith("tada_reference_text"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    current_value = str(voice_config.get("tada_reference_text", "")).strip()
+                    print(f"\nTADA reference text is currently: {current_value or '(empty)'}")
+                    print("Usage: /tada_reference_text <text>\n")
+                    continue
+                voice_config["tada_reference_text"] = parts[1].strip()
+                save_robot_config(voice_config)
+                tts_runtime["active_key"] = None
+                print("\n✅ tada_reference_text updated\n")
+                continue
+
+            if cmd == "tada_reference_record":
+                capture_tada_reference_from_mic(stt_runtime, voice_config)
+                tts_runtime["active_key"] = None
+                continue
+
+            if cmd.startswith("tada_model"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    current_value = str(voice_config.get("tada_model_id", "HumeAI/tada-1b")).strip()
+                    print(f"\nTADA model is currently: {current_value}")
+                    print("Usage: /tada_model <hf-model-id>\n")
+                    continue
+                voice_config["tada_model_id"] = parts[1].strip()
+                save_robot_config(voice_config)
+                tts_runtime["active_key"] = None
+                if str(voice_config.get("tts_backend", DEFAULT_TTS_BACKEND)).lower() == "tada":
+                    ensure_tts_runtime(tts_runtime, voice_config)
+                print(f"\n✅ tada_model_id = {voice_config['tada_model_id']}\n")
+                continue
+
+            if cmd.startswith("tada_codec"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    current_value = str(voice_config.get("tada_codec_id", "HumeAI/tada-codec")).strip()
+                    print(f"\nTADA codec is currently: {current_value}")
+                    print("Usage: /tada_codec <hf-codec-id>\n")
+                    continue
+                voice_config["tada_codec_id"] = parts[1].strip()
+                save_robot_config(voice_config)
+                tts_runtime["active_key"] = None
+                if str(voice_config.get("tts_backend", DEFAULT_TTS_BACKEND)).lower() == "tada":
+                    ensure_tts_runtime(tts_runtime, voice_config)
+                print(f"\n✅ tada_codec_id = {voice_config['tada_codec_id']}\n")
+                continue
+
+            if cmd.startswith("tada_device"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    current_value = str(voice_config.get("tada_device", "cpu")).strip()
+                    print(f"\nTADA device is currently: {current_value}")
+                    print("Usage: /tada_device <device>\n")
+                    continue
+                voice_config["tada_device"] = parts[1].strip()
+                save_robot_config(voice_config)
+                tts_runtime["active_key"] = None
+                if str(voice_config.get("tts_backend", DEFAULT_TTS_BACKEND)).lower() == "tada":
+                    ensure_tts_runtime(tts_runtime, voice_config)
+                print(f"\n✅ tada_device = {voice_config['tada_device']}\n")
+                continue
+
+            if cmd.startswith("tada_language"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    current_value = str(voice_config.get("tada_language", "en")).strip()
+                    print(f"\nTADA language is currently: {current_value}")
+                    print("Usage: /tada_language <lang>\n")
+                    continue
+                voice_config["tada_language"] = parts[1].strip().lower()
+                save_robot_config(voice_config)
+                tts_runtime["active_key"] = None
+                if str(voice_config.get("tts_backend", DEFAULT_TTS_BACKEND)).lower() == "tada":
+                    ensure_tts_runtime(tts_runtime, voice_config)
+                print(f"\n✅ tada_language = {voice_config['tada_language']}\n")
                 continue
 
             if cmd.startswith("repeat"):
@@ -7477,16 +8098,87 @@ def main() -> None:
                 if value in {"on", "1", "true", "yes", "y", "si", "sí"}:
                     voice_config["auto_listen_enabled"] = True
                     save_robot_config(voice_config)
-                    start_auto_listen(auto_listen_runtime, voice_config)
+                    refresh_auto_listen_worker(auto_listen_runtime, voice_config)
                     print("\n✅ auto_listen = on\n")
                     continue
                 if value in {"off", "0", "false", "no", "n"}:
                     voice_config["auto_listen_enabled"] = False
                     save_robot_config(voice_config)
-                    stop_auto_listen(auto_listen_runtime)
+                    refresh_auto_listen_worker(auto_listen_runtime, voice_config)
                     print("\n✅ auto_listen = off\n")
                     continue
                 print("\n⚠️ Use /auto_listen on|off\n")
+                continue
+
+            if cmd.startswith("wake_word_enabled") or cmd.startswith("wake_world_enabled"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    state = "on" if bool(voice_config.get("wake_word_enabled", False)) else "off"
+                    print(f"\nwake_word_enabled is currently: {state}")
+                    print("Usage: /wake_word_enabled true|false\n")
+                    continue
+                value = parts[1].strip().lower()
+                if value in {"on", "1", "true", "yes", "y", "si", "sí"}:
+                    voice_config["wake_word_enabled"] = True
+                    save_robot_config(voice_config)
+                    refresh_auto_listen_worker(auto_listen_runtime, voice_config)
+                    print("\n✅ wake_word_enabled = True\n")
+                    continue
+                if value in {"off", "0", "false", "no", "n"}:
+                    voice_config["wake_word_enabled"] = False
+                    save_robot_config(voice_config)
+                    refresh_auto_listen_worker(auto_listen_runtime, voice_config)
+                    print("\n✅ wake_word_enabled = False\n")
+                    continue
+                print("\n⚠️ Use /wake_word_enabled true|false\n")
+                continue
+
+            if cmd.startswith("wake_word_phrase"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    current_value = str(voice_config.get("wake_word_phrase", "hola robot")).strip()
+                    print(f"\nwake_word_phrase is currently: {current_value}")
+                    print("Usage: /wake_word_phrase <text>\n")
+                    continue
+                voice_config["wake_word_phrase"] = parts[1].strip()
+                save_robot_config(voice_config)
+                print(f"\n✅ wake_word_phrase = {voice_config['wake_word_phrase']}\n")
+                continue
+
+            if cmd.startswith("wake_word_stop_phrase"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    current_value = str(voice_config.get("wake_word_stop_phrase", "adios robot")).strip()
+                    print(f"\nwake_word_stop_phrase is currently: {current_value}")
+                    print("Usage: /wake_word_stop_phrase <text>\n")
+                    continue
+                voice_config["wake_word_stop_phrase"] = parts[1].strip()
+                save_robot_config(voice_config)
+                print(f"\n✅ wake_word_stop_phrase = {voice_config['wake_word_stop_phrase']}\n")
+                continue
+
+            if cmd.startswith("wake_word_on_response"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    current_value = str(voice_config.get("wake_word_on_response", "Te escucho.")).strip()
+                    print(f"\nwake_word_on_response is currently: {current_value}")
+                    print("Usage: /wake_word_on_response <text>\n")
+                    continue
+                voice_config["wake_word_on_response"] = parts[1].strip()
+                save_robot_config(voice_config)
+                print(f"\n✅ wake_word_on_response = {voice_config['wake_word_on_response']}\n")
+                continue
+
+            if cmd.startswith("wake_word_off_response"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    current_value = str(voice_config.get("wake_word_off_response", "Modo escucha desactivado.")).strip()
+                    print(f"\nwake_word_off_response is currently: {current_value}")
+                    print("Usage: /wake_word_off_response <text>\n")
+                    continue
+                voice_config["wake_word_off_response"] = parts[1].strip()
+                save_robot_config(voice_config)
+                print(f"\n✅ wake_word_off_response = {voice_config['wake_word_off_response']}\n")
                 continue
 
             if cmd.startswith("vad_silence"):
@@ -7506,9 +8198,13 @@ def main() -> None:
                     continue
                 voice_config["auto_listen_silence_ms"] = value_ms
                 save_robot_config(voice_config)
-                if bool(voice_config.get("auto_listen_enabled", False)):
+                if should_run_auto_listen_worker(voice_config):
                     stop_auto_listen(auto_listen_runtime)
-                    start_auto_listen(auto_listen_runtime, voice_config)
+                    start_auto_listen(
+                        auto_listen_runtime,
+                        voice_config,
+                        activate_session=bool(voice_config.get("auto_listen_enabled", False)),
+                    )
                     print(f"\n✅ vad_silence = {value_ms} ms | auto_listen restarted\n")
                 else:
                     print(f"\n✅ vad_silence = {value_ms} ms\n")
@@ -7531,9 +8227,13 @@ def main() -> None:
                     continue
                 voice_config["auto_listen_preroll_ms"] = value_ms
                 save_robot_config(voice_config)
-                if bool(voice_config.get("auto_listen_enabled", False)):
+                if should_run_auto_listen_worker(voice_config):
                     stop_auto_listen(auto_listen_runtime)
-                    start_auto_listen(auto_listen_runtime, voice_config)
+                    start_auto_listen(
+                        auto_listen_runtime,
+                        voice_config,
+                        activate_session=bool(voice_config.get("auto_listen_enabled", False)),
+                    )
                     print(f"\n✅ vad_preroll = {value_ms} ms | auto_listen restarted\n")
                 else:
                     print(f"\n✅ vad_preroll = {value_ms} ms\n")
@@ -7556,9 +8256,13 @@ def main() -> None:
                     continue
                 voice_config["auto_listen_max_segment_s"] = value_s
                 save_robot_config(voice_config)
-                if bool(voice_config.get("auto_listen_enabled", False)):
+                if should_run_auto_listen_worker(voice_config):
                     stop_auto_listen(auto_listen_runtime)
-                    start_auto_listen(auto_listen_runtime, voice_config)
+                    start_auto_listen(
+                        auto_listen_runtime,
+                        voice_config,
+                        activate_session=bool(voice_config.get("auto_listen_enabled", False)),
+                    )
                     print(f"\n✅ vad_max_segment = {value_s:.1f} s | auto_listen restarted\n")
                 else:
                     print(f"\n✅ vad_max_segment = {value_s:.1f} s\n")
@@ -7594,38 +8298,6 @@ def main() -> None:
                 print(f"\n✅ Whisper OpenVINO model selected: {selected['id']}\n")
                 if bool(voice_config.get("whisper_openvino", False)):
                     ensure_stt_runtime(stt_runtime, voice_config)
-                continue
-
-            if cmd == "parler_models":
-                parler_models = load_parler_ov_models()
-                list_parler_ov_models(
-                    parler_models,
-                    selected_id=str(voice_config.get("parler_model_id", "")).strip(),
-                )
-                continue
-
-            if cmd == "parler_add":
-                parler_models = load_parler_ov_models()
-                add_parler_ov_model_interactive(parler_models)
-                continue
-
-            if cmd == "parler_select":
-                parler_models = load_parler_ov_models()
-                selected_id = str(voice_config.get("parler_model_id", "")).strip()
-                selected = choose_parler_ov_model_interactive(
-                    parler_models,
-                    selected_id=selected_id,
-                    allow_download=False,
-                )
-                if selected is None:
-                    print("\nCancelled.\n")
-                    continue
-                voice_config["parler_model_id"] = selected["id"]
-                save_robot_config(voice_config)
-                tts_runtime["active_key"] = None
-                print(f"\n✅ Parler model selected: {selected['id']}\n")
-                if str(voice_config.get("tts_backend", DEFAULT_TTS_BACKEND)).lower() == "parler":
-                    ensure_tts_runtime(tts_runtime, voice_config)
                 continue
 
             if cmd == "openvino_tts_models":

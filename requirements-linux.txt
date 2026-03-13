@@ -8,9 +8,9 @@ setuptools<82
 sounddevice
 torch
 transformers
-parler-tts
 kokoro-onnx
 onnxruntime-openvino
 babelvox
 opencv-python
+PySide6
 silero-vad

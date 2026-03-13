@@ -7,6 +7,7 @@ import sys
 import types
 import uuid
 from pathlib import Path
+import numpy as np
 
 
 def load_robot_module(monkeypatch):
@@ -48,9 +49,15 @@ def test_default_robot_config_contains_camera_defaults(monkeypatch):
     assert cfg["vision_log_interval_s"] == 1.0
     assert cfg["vision_event_processing_enabled"] is True
     assert cfg["auto_listen_enabled"] is False
+    assert cfg["wake_word_enabled"] is False
+    assert cfg["wake_word_phrase"] == "hola robot"
+    assert cfg["wake_word_stop_phrase"] == "adios robot"
+    assert cfg["wake_word_on_response"] == "Te escucho."
+    assert cfg["wake_word_off_response"] == "Modo escucha desactivado."
     assert cfg["audio_input_device"] == ""
     assert cfg["audio_monitor_enabled"] is False
     assert cfg["visual_effects_enabled"] is True
+    assert cfg["panel_backend"] == "opencv"
     assert cfg["auto_listen_aggressiveness"] == 3
     assert cfg["auto_listen_threshold"] == 0.50
     assert cfg["auto_listen_frame_ms"] == 32
@@ -61,6 +68,54 @@ def test_default_robot_config_contains_camera_defaults(monkeypatch):
     assert cfg["auto_listen_min_segment_ms"] == 1400
     assert cfg["auto_listen_min_voiced_ratio"] == 0.60
     assert cfg["auto_listen_resume_delay_ms"] == 1500
+    assert cfg["tada_model_id"] == "HumeAI/tada-1b"
+    assert cfg["tada_codec_id"] == "HumeAI/tada-codec"
+    assert cfg["tada_device"] == "cpu"
+    assert cfg["tada_reference_audio_path"] == ""
+    assert cfg["tada_reference_text"] == ""
+
+
+def test_tts_backend_options_include_tada(monkeypatch):
+    robot = load_robot_module(monkeypatch)
+    assert "tada" in robot.TTS_BACKEND_OPTIONS
+
+
+def test_capture_tada_reference_from_mic_updates_config(monkeypatch):
+    robot = load_robot_module(monkeypatch)
+    cfg = robot.default_robot_config()
+    tmp_dir = make_local_tmp_dir()
+    try:
+        monkeypatch.setattr(robot, "CACHE_DIR", tmp_dir)
+        monkeypatch.setattr(robot, "save_robot_config", lambda config: None)
+        monkeypatch.setattr(robot, "ensure_stt_runtime", lambda stt_runtime, config: True)
+        monkeypatch.setattr(robot, "resolve_audio_input_device", lambda config, sd_mod: None)
+        monkeypatch.setattr(
+            robot,
+            "record_until_space",
+            lambda sd_mod, np_mod, sample_rate=16000, channels=1, blocksize=1024, device=None: (
+                np.array([0.1, -0.1, 0.2], dtype=np.float32),
+                1.0,
+            ),
+        )
+        monkeypatch.setattr(
+            robot,
+            "transcribe_audio_buffer",
+            lambda stt_runtime, config, audio, speech_end_ts=None: ("Hola, esta es mi voz.", 0.1),
+        )
+        stt_runtime = {"numpy": np, "sounddevice": object()}
+
+        wav_path, text = robot.capture_tada_reference_from_mic(stt_runtime, cfg)
+
+        assert wav_path is not None
+        assert wav_path.exists()
+        assert wav_path.name == "tada_reference.wav"
+        assert text == "Hola, esta es mi voz."
+        assert cfg["tada_reference_audio_path"] == str(wav_path)
+        assert cfg["tada_reference_text"] == "Hola, esta es mi voz."
+    finally:
+        for child in tmp_dir.iterdir():
+            child.unlink()
+        os.rmdir(tmp_dir)
 
 
 def test_load_robot_config_accepts_npu_for_vision_device(monkeypatch):
@@ -183,6 +238,65 @@ def test_initialize_native_voice_engine_windows_path(monkeypatch):
     assert voices is not None
     assert speaker.Rate == 1
     assert speaker.Volume == 55
+
+
+def test_apply_voice_config_resets_windows_tts_warmup(monkeypatch):
+    robot = load_robot_module(monkeypatch)
+
+    class FakeVoice:
+        def GetDescription(self):
+            return "Voice A"
+
+    class FakeVoices:
+        Count = 1
+
+        def Item(self, index):
+            return FakeVoice()
+
+    class FakeSpeaker:
+        def __init__(self):
+            self.Rate = None
+            self.Volume = None
+            self.Voice = None
+
+    cfg = {"voice_index": 0, "rate": 1, "volume": 55, "_tts_warmup_done": True}
+    speaker = FakeSpeaker()
+
+    robot.apply_voice_config(speaker, FakeVoices(), cfg)
+
+    assert cfg["_tts_warmup_done"] is False
+
+
+def test_speak_text_keeps_configured_silence_after_warmup(monkeypatch):
+    robot = load_robot_module(monkeypatch)
+    monkeypatch.setattr(robot, "IS_WINDOWS", True)
+
+    class FakeSpeaker:
+        def __init__(self):
+            self.calls = []
+            self.wait_calls = 0
+
+        def Speak(self, text, flags):
+            self.calls.append((text, flags))
+
+        def WaitUntilDone(self, timeout_ms):
+            self.wait_calls += 1
+            return True
+
+    speaker = FakeSpeaker()
+    cfg = {"silence": 600, "warmup_tts": True}
+
+    interrupted_1, _latency_1 = robot.speak_text(speaker, "hola mundo", cfg, allow_interrupt=False)
+    interrupted_2, _latency_2 = robot.speak_text(speaker, "segunda frase", cfg, allow_interrupt=False)
+
+    assert interrupted_1 is False
+    assert interrupted_2 is False
+    assert len(speaker.calls) == 3
+    assert "hola mundo" not in speaker.calls[0][0].lower()
+    assert '<silence msec="600"/>' in speaker.calls[1][0]
+    assert '<silence msec="600"/>' in speaker.calls[2][0]
+    assert "hola mundo" in speaker.calls[1][0]
+    assert "segunda frase" in speaker.calls[2][0]
 
 
 def test_choose_voice_interactive_is_blocked_on_linux(monkeypatch, capsys):
@@ -349,6 +463,57 @@ def test_format_vad_debug_output_serializes_payload(monkeypatch):
     payload = json.loads(text)
     assert payload["speech"] is True
     assert payload["rms"] == 0.12
+
+
+def test_show_llm_context_prints_system_and_memory(monkeypatch, capsys):
+    robot = load_robot_module(monkeypatch)
+    cfg = {"system_prompt": "Be concise.", "max_new_tokens": 300}
+
+    robot.show_llm_context(["User: hola", "Assistant: que tal"], cfg)
+
+    out = capsys.readouterr().out
+    assert "Current LLM context" in out
+    assert "Be concise." in out
+    assert "User: hola" in out
+    assert "Assistant: que tal" in out
+    assert "Memory entries: 2" in out
+
+
+def test_spoken_phrase_to_words_and_match(monkeypatch):
+    robot = load_robot_module(monkeypatch)
+
+    assert robot.spoken_phrase_to_words(" Hola, Róbót! ") == ["hola", "robot"]
+    assert robot.transcript_matches_phrase("HOLA, róbot.", "hola robot") is True
+    assert robot.transcript_matches_phrase("hola, robot", "hóla róbot") is True
+    assert robot.transcript_matches_phrase("hola robot ahora", "hola robot") is False
+
+
+def test_handle_wake_word_transcript_activates_and_deactivates(monkeypatch):
+    robot = load_robot_module(monkeypatch)
+    spoken = []
+    saved = []
+
+    monkeypatch.setattr(robot, "save_robot_config", lambda cfg: saved.append(dict(cfg)))
+    monkeypatch.setattr(robot, "speak_wake_word_response", lambda message, speaker, config, tts_runtime: spoken.append(message))
+
+    cfg = {
+        "wake_word_enabled": True,
+        "wake_word_phrase": "hola robot",
+        "wake_word_stop_phrase": "chau robot",
+        "wake_word_on_response": "Te escucho.",
+        "wake_word_off_response": "Modo escucha desactivado.",
+        "auto_listen_enabled": False,
+    }
+
+    consumed = robot.handle_wake_word_transcript("Hola Robot", {}, None, cfg, {})
+    assert consumed is True
+    assert cfg["auto_listen_enabled"] is True
+    assert spoken[-1] == "Te escucho."
+
+    consumed = robot.handle_wake_word_transcript("chau robot", {}, None, cfg, {})
+    assert consumed is True
+    assert cfg["auto_listen_enabled"] is False
+    assert spoken[-1] == "Modo escucha desactivado."
 
 
 def test_build_audio_monitor_frame_has_expected_shape(monkeypatch):

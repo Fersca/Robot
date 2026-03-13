@@ -70,7 +70,7 @@ Language selection is configurable. OpenVINO Whisper also supports model catalog
 
 The runtime has a separate camera worker and an optional OpenCV panel window.
 
-- `/panel` opens the control panel UI.
+- `/panel opencv|qt` opens the control panel UI with the selected renderer.
 - The camera/vision worker can run headless even when the panel is closed.
 - `/camera on` can start camera processing without rendering the panel.
 - Vision detection can trigger reactive TTS messages when people enter, leave, or disappear.
@@ -83,11 +83,11 @@ The runtime has a separate camera worker and an optional OpenCV panel window.
 Supported backends:
 
 - `windows`: Windows SAPI via `win32com.client`
-- `parler`: CPU PyTorch Parler-TTS
 - `openvino`: `ov_genai.Text2SpeechPipeline`
 - `kokoro`: `kokoro-onnx`
 - `babelvox`: `babelvox`
 - `espeakng`: external `espeak-ng` or `espeak` executable
+- `tada`: Hume TADA voice-conditioned TTS using a reference audio clip plus transcript
 
 `speak_text_backend()` dispatches to the selected engine. Several backends lazily install/import optional dependencies the first time they are used.
 
@@ -97,6 +97,7 @@ Important implementation details:
 - Streaming TTS is supported while the LLM is still generating.
 - `ESC` is used to interrupt generation or audio playback.
 - Audio cancellation can also be triggered internally by vision logic, not only by keyboard input.
+- `tada` is experimental and CPU-first in this repo; it currently follows the official PyTorch-based flow rather than an OpenVINO path.
 
 ## Persisted State
 
@@ -106,7 +107,6 @@ Common files:
 
 - `~/ov_models/models.json`
 - `~/ov_models/whisper_models.json`
-- `~/ov_models/parler_models.json`
 - `~/ov_models/openvino_tts_models.json`
 - `~/ov_models/kokoro_models.json`
 - `~/ov_models/babelvox_models.json`
@@ -128,7 +128,8 @@ The main command surface includes:
 
 - `/models`, `/add_model`, `/delete`
 - `/llm_backend local|external`
-- `/tts_backend windows|parler|openvino|kokoro|babelvox|espeakng`
+- `/tts_backend windows|openvino|kokoro|babelvox|espeakng|tada`
+- `/tada_reference_record`, `/tada_reference_audio`, `/tada_reference_text`, `/tada_model`, `/tada_codec`, `/tada_device`, `/tada_language`
 - `/panel`
 - `/camera on|off`
 - `/vision on|off`
@@ -139,7 +140,6 @@ The main command surface includes:
 - `/auto_listen on|off`
 - `/config`
 - `/whisper_models`, `/whisper_add`, `/whisper_select`
-- `/parler_models`, `/parler_add`, `/parler_select`
 - `/openvino_tts_models`, `/openvino_tts_add`, `/openvino_tts_select`
 - `/kokoro_models`, `/kokoro_select`
 - `/babelvox_models`, `/babelvox_select`
@@ -162,6 +162,7 @@ This repo provides OS-specific dependency files:
 
 - `requirements-windows.txt`
 - `requirements-linux.txt`
+- `requirements-tada.txt` for the optional Hume TADA backend
 
 Dependencies are still partly optional at runtime because several backends are lazy-loaded. Key packages referenced by the code:
 
@@ -174,10 +175,12 @@ Dependencies are still partly optional at runtime because several backends are l
 - `openai-whisper`
 - `torch`
 - `transformers`
-- `parler-tts`
 - `kokoro-onnx`
 - `onnxruntime-openvino`
 - `babelvox`
+
+`requirements-tada.txt` is intentionally separate because the Hume TADA backend is optional in this repo.
+The code also includes a small compatibility shim for older `huggingface_hub` progress-bar APIs when initializing TADA.
 
 `espeakng` additionally requires the `espeak-ng` executable installed on the host.
 

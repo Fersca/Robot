@@ -1,0 +1,7 @@
+# Optional TADA stack.
+# Note: Hume TADA currently conflicts with the Parler-TTS version used by this project
+# because they require incompatible transformers versions.
+# Install this only if you want to experiment with TADA and accept that Parler may stop working
+# in the same Python environment.
+torchaudio
+git+https://github.com/HumeAI/tada.git

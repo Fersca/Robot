@@ -39,7 +39,7 @@ It also supports:
 
 - manual `/listen` mode with `SPACE` start/stop and `ESC` exit
 - continuous `/auto_listen on` mode with Silero VAD
-- an optional `/panel` window for rendering the robot avatar, camera preview, toggles, and VAD bars
+- an optional `/panel opencv` or `/panel qt` window for rendering the robot avatar, camera preview, toggles, and VAD bars
 - headless camera/vision processing even when the panel is closed
 
 ## Presence And Panel
@@ -74,11 +74,12 @@ The camera worker is independent from the panel. That means `/camera on`, `/visi
 ### Text-to-Speech
 
 - Windows SAPI on Windows
-- Parler-TTS on CPU
 - OpenVINO Text2SpeechPipeline
 - Kokoro ONNX
 - BabelVox
 - eSpeak NG
+- Hume TADA voice-conditioned TTS with reference audio
+- Reference voice capture from the microphone for Hume TADA
 
 ## Functionality Overview
 
@@ -88,7 +89,8 @@ The camera worker is independent from the panel. That means `/camera on`, `/visi
 - Whisper preload on startup
 - Continuous auto-listen with Silero VAD
 - Streaming TTS while the LLM is still generating
-- Multiple TTS backends: Windows SAPI, Parler, OpenVINO, Kokoro, BabelVox, eSpeak NG
+- Multiple TTS backends: Windows SAPI, OpenVINO, Kokoro, BabelVox, eSpeak NG, Hume TADA
+- Experimental Hume TADA backend that can synthesize new text conditioned on a reference voice clip plus transcript
 - Optional control panel with robot avatar, camera preview, switches, and VAD bars
 - Camera presence detection and reactive voice behavior
 - Face detection through OpenVINO vision models
@@ -105,6 +107,12 @@ The camera worker is independent from the panel. That means `/camera on`, `/visi
 - [`AGENTS.md`](./AGENTS.md): repository context for coding agents
 - [`vision_models.json`](./vision_models.json): vision model catalog
 - [`ov_models/models.json`](./ov_models/models.json): LLM model catalog
+- [`requirements-tada.txt`](./requirements-tada.txt): optional Hume TADA stack
+
+TADA note:
+
+- `requirements-tada.txt` is optional on purpose
+- it installs the extra stack needed for the Hume TADA backend
 
 ## Screenshots
 
@@ -190,7 +198,7 @@ For a first session, the recommended flow is:
 /config
 /voices
 /llm_backend local|external
-/tts_backend windows|parler|openvino|kokoro|babelvox|espeakng
+/tts_backend windows|openvino|kokoro|babelvox|espeakng|tada
 /audio <on|off>
 /audio_inputs
 /audio_input_select
@@ -211,9 +219,6 @@ For a first session, the recommended flow is:
 /whisper_models
 /whisper_add
 /whisper_select
-/parler_models
-/parler_add
-/parler_select
 /openvino_tts_models
 /openvino_tts_add
 /openvino_tts_select
