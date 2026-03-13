@@ -18,7 +18,6 @@ import subprocess
 import sys
 import threading
 import time
-import unicodedata
 import uuid
 import wave
 import urllib.request
@@ -26,6 +25,51 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
+
+BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from robotlib.config import (
+    RobotConfigEnv,
+    build_default_robot_config,
+    load_robot_config as load_robot_config_impl,
+    save_robot_config as save_robot_config_impl,
+)
+from robotlib.core.chat import (
+    append_assistant_message,
+    append_user_message,
+    build_chat_prompt,
+)
+from robotlib.core.memory import render_llm_context
+from robotlib.core.vision_presence import (
+    choose_vision_event_response as choose_vision_event_response_impl,
+    handle_vision_tick as handle_vision_tick_impl,
+)
+from robotlib.core.wake_word import (
+    apply_wake_word_transcript,
+    is_valid_auto_listen_transcript as is_valid_auto_listen_transcript_impl,
+    should_run_auto_listen_worker as should_run_auto_listen_worker_impl,
+    spoken_phrase_to_words as spoken_phrase_to_words_impl,
+    transcript_matches_phrase as transcript_matches_phrase_impl,
+)
+from robotlib.paths import build_robot_paths
+from robotlib.state import (
+    build_auto_listen_runtime,
+    build_camera_runtime,
+    build_llm_state,
+    build_server_state,
+    build_stt_runtime,
+    build_tts_runtime,
+)
+from robotlib.stt.runtime import STTRuntimeDeps, ensure_stt_runtime as ensure_stt_runtime_impl
+from robotlib.stt.runtime import transcribe_audio_buffer as transcribe_audio_buffer_impl
+from robotlib.stt.runtime import transcribe_from_mic as transcribe_from_mic_impl
+from robotlib.tts.runtime import (
+    emit_vision_event_message as emit_vision_event_message_impl,
+    interrupt_audio_and_speak as interrupt_audio_and_speak_impl,
+    vision_event_tts_worker as vision_event_tts_worker_impl,
+)
 
 IS_WINDOWS = platform.system().lower() == "windows"
 IS_LINUX = platform.system().lower() == "linux"
@@ -203,21 +247,20 @@ STATS_MODE_BENCHMARK = "benchmark"
 ACTIVE_DEVICE = DEFAULT_DEVICE
 ACTIVE_PERFORMANCE_HINT = DEFAULT_PERFORMANCE_HINT
 
-CACHE_DIR = Path.home() / "ov_models"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-STATS_FILE = CACHE_DIR / "stats.json"
-AUTH_FILE = CACHE_DIR / "hf_auth.json"  # {"hf_token": "hf_..."}
-BENCHMARK_PROMPTS_FILE = CACHE_DIR / "benchmark_prompts.json"
-DEVICE_COMPAT_FILE = CACHE_DIR / "device_compat.json"
-MODELS_FILE = CACHE_DIR / "models.json"
-ROBOT_CONFIG_FILE = Path(__file__).resolve().parent / "robot_config.json"
-WHISPER_OV_MODELS_FILE = CACHE_DIR / "whisper_models.json"
-OV_TTS_MODELS_FILE = CACHE_DIR / "openvino_tts_models.json"
-KOKORO_MODELS_FILE = CACHE_DIR / "kokoro_models.json"
-BABELVOX_MODELS_FILE = CACHE_DIR / "babelvox_models.json"
-VISION_MODELS_FILE = Path(__file__).resolve().parent / "vision_models.json"
-VISION_EVENT_RESPONSES_FILE = Path(__file__).resolve().parent / "vision_event_responses.json"
+PATHS = build_robot_paths(Path(__file__).resolve().parent)
+CACHE_DIR = PATHS.cache_dir
+STATS_FILE = PATHS.stats_file
+AUTH_FILE = PATHS.auth_file  # {"hf_token": "hf_..."}
+BENCHMARK_PROMPTS_FILE = PATHS.benchmark_prompts_file
+DEVICE_COMPAT_FILE = PATHS.device_compat_file
+MODELS_FILE = PATHS.models_file
+ROBOT_CONFIG_FILE = PATHS.robot_config_file
+WHISPER_OV_MODELS_FILE = PATHS.whisper_ov_models_file
+OV_TTS_MODELS_FILE = PATHS.ov_tts_models_file
+KOKORO_MODELS_FILE = PATHS.kokoro_models_file
+BABELVOX_MODELS_FILE = PATHS.babelvox_models_file
+VISION_MODELS_FILE = PATHS.vision_models_file
+VISION_EVENT_RESPONSES_FILE = PATHS.vision_event_responses_file
 
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
 DEFAULT_WHISPER_MODEL = "base"
@@ -1449,27 +1492,7 @@ def format_vad_debug_output(payload: dict) -> str:
 
 
 def show_llm_context(history: list[str], config: dict) -> None:
-    memory = [str(item).strip() for item in list(history or []) if str(item).strip()]
-    system_prompt = str(config.get("system_prompt", "")).strip()
-    max_new_tokens = int(config.get("max_new_tokens", 300))
-    max_words_estimate = max(1, int(max_new_tokens * 0.65))
-    system_limit_note = f"Anexo: No respondas con mas de {max_words_estimate} palabras."
-    effective_system_prompt = (
-        f"{system_prompt}\n{system_limit_note}" if system_prompt else system_limit_note
-    )
-
-    print("\nCurrent LLM context:\n")
-    print("System:")
-    print("-----")
-    print(effective_system_prompt)
-    print("-----\n")
-    print(f"Memory entries: {len(memory)}")
-    if not memory:
-        print("(history is empty)\n")
-        return
-    for idx, item in enumerate(memory, 1):
-        print(f"{idx:>3}. {item}")
-    print("")
+    print(render_llm_context(history, str(config.get("system_prompt", "")), int(config.get("max_new_tokens", 300))))
 
 
 def should_emit_vision_log(camera_runtime: dict, now_ts: float | None = None) -> bool:
@@ -1540,15 +1563,12 @@ def load_vision_event_responses() -> dict[str, list[str]]:
 
 
 def choose_vision_event_response(category: str, count: int) -> str | None:
-    responses = load_vision_event_responses()
-    options = list(responses.get(category, []))
-    if not options:
-        return None
-    template = random.choice(options)
-    try:
-        return str(template).format(count=count)
-    except Exception:
-        return str(template)
+    return choose_vision_event_response_impl(
+        category,
+        count,
+        responses_loader=load_vision_event_responses,
+        chooser=random.choice,
+    )
 
 
 def set_robot_face_gesture(camera_runtime: dict, gesture: str, duration_s: float = 1.2) -> None:
@@ -1557,103 +1577,48 @@ def set_robot_face_gesture(camera_runtime: dict, gesture: str, duration_s: float
 
 
 def handle_vision_tick(camera_runtime: dict, detections: list[dict]) -> str | None:
-    current_count = len(detections)
-    previous_count = int(camera_runtime.get("vision_last_detection_count", 0))
-    camera_runtime["vision_last_detection_count"] = current_count
-
-    if current_count == previous_count:
-        return None
-    if previous_count == 0 and current_count > 0:
-        set_robot_face_gesture(camera_runtime, "join")
-        if bool(camera_runtime.get("suppress_next_join_after_interrupt", False)):
-            camera_runtime["suppress_next_join_after_interrupt"] = False
-            return None
-        return choose_vision_event_response("first_person_joined", current_count)
-    if current_count > previous_count:
-        set_robot_face_gesture(camera_runtime, "join")
-        return choose_vision_event_response("more_people_joined", current_count)
-    if current_count == 0:
-        set_robot_face_gesture(camera_runtime, "leave")
-        if is_audio_playback_active() or is_tts_active():
-            camera_runtime["suppress_next_join_after_interrupt"] = True
-            return "__INTERRUPT_AUDIO__:me cayo"
-        return choose_vision_event_response("alone_again", current_count)
-    set_robot_face_gesture(camera_runtime, "leave")
-    return choose_vision_event_response("fewer_people_left", current_count)
+    return handle_vision_tick_impl(
+        camera_runtime,
+        detections,
+        choose_response=choose_vision_event_response,
+        set_gesture=set_robot_face_gesture,
+        is_audio_playing=is_audio_playback_active,
+        is_tts_active=is_tts_active,
+    )
 
 
 def _vision_event_tts_worker(camera_runtime: dict) -> None:
-    stop_event = camera_runtime.get("stop_event")
-    event_queue = camera_runtime.get("vision_event_queue")
-    if stop_event is None or not isinstance(event_queue, queue.Queue):
-        return
-    while not stop_event.is_set() or not event_queue.empty():
-        try:
-            message = event_queue.get(timeout=0.2)
-        except queue.Empty:
-            continue
-        if not message:
-            continue
-        config = camera_runtime.get("voice_config")
-        tts_runtime = camera_runtime.get("tts_runtime")
-        speaker = camera_runtime.get("speaker")
-        if not isinstance(config, dict) or not bool(config.get("audio_enabled", True)):
-            continue
-        if not isinstance(tts_runtime, dict):
-            continue
-        if is_audio_playback_active() or is_tts_active():
-            continue
-        try:
-            speak_text_backend(
-                speaker,
-                str(message),
-                config,
-                tts_runtime,
-                allow_interrupt=True,
-            )
-        except Exception as exc:
-            print_error_red(f"ERROR: Vision event TTS failed: {exc}")
+    vision_event_tts_worker_impl(
+        camera_runtime,
+        speak_text_backend=speak_text_backend,
+        print_error_red=print_error_red,
+        is_audio_playback_active=is_audio_playback_active,
+        is_tts_active=is_tts_active,
+    )
 
 
 def emit_vision_event_message(camera_runtime: dict, message: str) -> None:
-    if not message:
-        return
-    if is_audio_playback_active() or is_tts_active():
-        return
-    event_queue = camera_runtime.get("vision_event_queue")
-    if not isinstance(event_queue, queue.Queue):
-        return
-    try:
-        event_queue.put_nowait(str(message))
-    except queue.Full:
-        pass
+    emit_vision_event_message_impl(
+        camera_runtime,
+        message,
+        is_audio_playback_active=is_audio_playback_active,
+        is_tts_active=is_tts_active,
+    )
 
 
 def interrupt_audio_and_speak(camera_runtime: dict, message: str) -> None:
-    if not message:
-        return
-    config = camera_runtime.get("voice_config")
-    tts_runtime = camera_runtime.get("tts_runtime")
-    speaker = camera_runtime.get("speaker")
-    if not isinstance(config, dict) or not bool(config.get("audio_enabled", True)):
-        return
-    if not isinstance(tts_runtime, dict):
-        return
-    request_audio_cancel()
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline and (is_audio_playback_active() or is_tts_active()):
-        time.sleep(0.02)
-    clear_audio_cancel()
-    try:
-        speak_text_backend(
-            speaker,
-            str(message),
-            config,
-            tts_runtime,
-            allow_interrupt=True,
-        )
-    except Exception as exc:
-        print_error_red(f"ERROR: Vision interrupt TTS failed: {exc}")
+    interrupt_audio_and_speak_impl(
+        camera_runtime,
+        message,
+        request_audio_cancel=request_audio_cancel,
+        is_audio_playback_active=is_audio_playback_active,
+        is_tts_active=is_tts_active,
+        clear_audio_cancel=clear_audio_cancel,
+        sleep_fn=time.sleep,
+        monotonic_fn=time.monotonic,
+        speak_text_backend=speak_text_backend,
+        print_error_red=print_error_red,
+    )
 
 
 def open_camera_capture(cv2_mod, device_index: int):
@@ -3854,286 +3819,50 @@ def start_openai_compatible_server(state: dict) -> ThreadingHTTPServer:
 # Voice + STT
 # =========================
 def default_robot_config() -> dict:
-    return {
-        "voice_index": 0,
-        "rate": -2,
-        "volume": 100,
-        "silence": 600,
-        "whisper_model": DEFAULT_WHISPER_MODEL,
-        "whisper_language": "es",
-        "repeat": False,
-        "current_model_repo": "",
-        "llm_backend": "local",
-        "llm_device": DEFAULT_DEVICE,
-        "llm_performance_hint": DEFAULT_PERFORMANCE_HINT,
-        "external_llm_base_url": "http://localhost:1234",
-        "external_llm_model": "",
-        "external_llm_api_key": "",
-        "audio_enabled": True,
-        "audio_input_device": "",
-        "audio_monitor_enabled": False,
-        "visual_effects_enabled": True,
-        "panel_backend": "opencv",
-        "camera_enabled": False,
-        "camera_device_index": 0,
-        "vision_enabled": False,
-        "vision_model_id": "",
-        "vision_model_path": "",
-        "vision_labels_path": "",
-        "vision_device": "AUTO",
-        "vision_threshold": 0.4,
-        "vision_log_enabled": False,
-        "vision_log_interval_s": 1.0,
-        "vision_event_processing_enabled": True,
-        "auto_listen_enabled": False,
-        "wake_word_enabled": False,
-        "wake_word_phrase": "hola robot",
-        "wake_word_stop_phrase": "adios robot",
-        "wake_word_on_response": "Te escucho.",
-        "wake_word_off_response": "Modo escucha desactivado.",
-        "auto_listen_aggressiveness": 3,
-        "auto_listen_threshold": 0.50,
-        "auto_listen_frame_ms": 32,
-        "auto_listen_preroll_ms": 350,
-        "auto_listen_min_speech_ms": 1400,
-        "auto_listen_silence_ms": 1600,
-        "auto_listen_max_segment_s": 60.0,
-        "auto_listen_resume_delay_ms": 1500,
-        "auto_listen_min_segment_ms": 1400,
-        "auto_listen_min_voiced_ratio": 0.60,
-        "tts_streaming_enabled": False,
-        "tts_stream_min_words": 12,
-        "tts_stream_cut_on_punctuation": False,
-        "system_prompt": "",
-        "max_new_tokens": 300,
-        "warmup_tts": True,
-        "whisper_openvino": False,
-        "whisper_openvino_device": "AUTO",
-        "whisper_openvino_model_id": "",
-        "tts_backend": DEFAULT_TTS_BACKEND,
-        "openvino_tts_device": "AUTO",
-        "openvino_tts_model_id": "",
-        "openvino_tts_timeout_s": 25,
-        "openvino_tts_isolated_gpu": True,
-        "openvino_tts_speed": 1.0,
-        "openvino_tts_gain": 1.0,
-        "kokoro_model_id": "kokoro-tts-intel",
-        "kokoro_device": "GPU",
-        "kokoro_voice": "af_sarah",
-        "babelvox_model_id": "babelvox-openvino-int8",
-        "babelvox_device": "CPU",
-        "babelvox_precision": "int8",
-        "babelvox_language": "es",
-        "tada_model_id": "HumeAI/tada-1b",
-        "tada_codec_id": "HumeAI/tada-codec",
-        "tada_device": "cpu",
-        "tada_language": "en",
-        "tada_reference_audio_path": "",
-        "tada_reference_text": "",
-        "tada_sample_rate": 24000,
-        "espeak_voice": "es",
-        "espeak_rate": 145,
-        "espeak_pitch": 45,
-        "espeak_amplitude": 120,
-    }
+    env = RobotConfigEnv(
+        robot_config_file=ROBOT_CONFIG_FILE,
+        platform_name=PLATFORM_NAME,
+        default_device=DEFAULT_DEVICE,
+        default_performance_hint=DEFAULT_PERFORMANCE_HINT,
+        default_whisper_model=DEFAULT_WHISPER_MODEL,
+        default_tts_backend=DEFAULT_TTS_BACKEND,
+        whisper_ov_device_options=WHISPER_OV_DEVICE_OPTIONS,
+        whisper_language_options=WHISPER_LANGUAGE_OPTIONS,
+        openvino_tts_device_options=PARLER_OV_DEVICE_OPTIONS,
+        kokoro_device_options=KOKORO_DEVICE_OPTIONS,
+        babelvox_device_options=BABELVOX_DEVICE_OPTIONS,
+        babelvox_precision_options=BABELVOX_PRECISION_OPTIONS,
+    )
+    return build_default_robot_config(env)
 
 
 def load_robot_config() -> dict:
-    cfg = default_robot_config()
-    if not ROBOT_CONFIG_FILE.exists():
-        return cfg
-    try:
-        data = json.loads(ROBOT_CONFIG_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            if "repeat" not in data and "repetir" in data:
-                data["repeat"] = data.get("repetir", False)
-            data.pop("repetir", None)
-            cfg.update(data)
-    except Exception as exc:
-        print(f"\n⚠️ Could not read {ROBOT_CONFIG_FILE}: {exc}\n")
-    cfg["whisper_openvino"] = bool(cfg.get("whisper_openvino", False))
-    llm_backend = str(cfg.get("llm_backend", "local")).strip().lower()
-    if llm_backend not in {"local", "external"}:
-        llm_backend = "local"
-    cfg["llm_backend"] = llm_backend
-    cfg["external_llm_base_url"] = str(cfg.get("external_llm_base_url", "http://localhost:1234")).strip() or "http://localhost:1234"
-    cfg["external_llm_model"] = str(cfg.get("external_llm_model", "")).strip()
-    cfg["external_llm_api_key"] = str(cfg.get("external_llm_api_key", "")).strip()
-    cfg["audio_input_device"] = str(cfg.get("audio_input_device", "")).strip()
-    cfg["audio_monitor_enabled"] = bool(cfg.get("audio_monitor_enabled", False))
-    cfg["visual_effects_enabled"] = bool(cfg.get("visual_effects_enabled", True))
-    panel_backend = str(cfg.get("panel_backend", "opencv")).strip().lower()
-    if panel_backend not in {"opencv", "qt"}:
-        panel_backend = "opencv"
-    cfg["panel_backend"] = panel_backend
-    cfg["camera_enabled"] = bool(cfg.get("camera_enabled", False))
-    try:
-        cfg["camera_device_index"] = max(0, int(cfg.get("camera_device_index", 0)))
-    except Exception:
-        cfg["camera_device_index"] = 0
-    cfg["vision_enabled"] = bool(cfg.get("vision_enabled", False))
-    cfg["vision_model_id"] = str(cfg.get("vision_model_id", "")).strip()
-    cfg["vision_model_path"] = str(cfg.get("vision_model_path", "")).strip()
-    cfg["vision_labels_path"] = str(cfg.get("vision_labels_path", "")).strip()
-    vision_device = str(cfg.get("vision_device", "AUTO")).strip().upper() or "AUTO"
-    if vision_device not in {"CPU", "GPU", "NPU", "AUTO"}:
-        vision_device = "AUTO"
-    cfg["vision_device"] = vision_device
-    try:
-        cfg["vision_threshold"] = float(cfg.get("vision_threshold", 0.4))
-    except Exception:
-        cfg["vision_threshold"] = 0.4
-    cfg["vision_threshold"] = min(1.0, max(0.0, cfg["vision_threshold"]))
-    cfg["vision_log_enabled"] = bool(cfg.get("vision_log_enabled", False))
-    try:
-        cfg["vision_log_interval_s"] = max(0.1, float(cfg.get("vision_log_interval_s", 1.0)))
-    except Exception:
-        cfg["vision_log_interval_s"] = 1.0
-    cfg["vision_event_processing_enabled"] = bool(cfg.get("vision_event_processing_enabled", True))
-    cfg["auto_listen_enabled"] = bool(cfg.get("auto_listen_enabled", False))
-    cfg["wake_word_enabled"] = bool(cfg.get("wake_word_enabled", False))
-    cfg["wake_word_phrase"] = str(cfg.get("wake_word_phrase", "hola robot")).strip() or "hola robot"
-    cfg["wake_word_stop_phrase"] = str(cfg.get("wake_word_stop_phrase", "adios robot")).strip() or "adios robot"
-    cfg["wake_word_on_response"] = str(cfg.get("wake_word_on_response", "Te escucho.")).strip() or "Te escucho."
-    cfg["wake_word_off_response"] = str(cfg.get("wake_word_off_response", "Modo escucha desactivado.")).strip() or "Modo escucha desactivado."
-    try:
-        cfg["auto_listen_aggressiveness"] = min(3, max(0, int(cfg.get("auto_listen_aggressiveness", 3))))
-    except Exception:
-        cfg["auto_listen_aggressiveness"] = 3
-    try:
-        cfg["auto_listen_threshold"] = float(cfg.get("auto_listen_threshold", 0.50))
-    except Exception:
-        cfg["auto_listen_threshold"] = 0.50
-    cfg["auto_listen_threshold"] = min(0.99, max(0.01, cfg["auto_listen_threshold"]))
-    try:
-        frame_ms = int(cfg.get("auto_listen_frame_ms", 32))
-    except Exception:
-        frame_ms = 32
-    cfg["auto_listen_frame_ms"] = frame_ms if frame_ms in {32, 64, 96} else 32
-    try:
-        cfg["auto_listen_preroll_ms"] = max(0, int(cfg.get("auto_listen_preroll_ms", 300)))
-    except Exception:
-        cfg["auto_listen_preroll_ms"] = 300
-    try:
-        cfg["auto_listen_min_speech_ms"] = max(30, int(cfg.get("auto_listen_min_speech_ms", 1400)))
-    except Exception:
-        cfg["auto_listen_min_speech_ms"] = 1400
-    try:
-        cfg["auto_listen_silence_ms"] = max(100, int(cfg.get("auto_listen_silence_ms", 900)))
-    except Exception:
-        cfg["auto_listen_silence_ms"] = 900
-    try:
-        cfg["auto_listen_max_segment_s"] = max(1.0, float(cfg.get("auto_listen_max_segment_s", 15.0)))
-    except Exception:
-        cfg["auto_listen_max_segment_s"] = 15.0
-    try:
-        cfg["auto_listen_resume_delay_ms"] = max(0, int(cfg.get("auto_listen_resume_delay_ms", 1500)))
-    except Exception:
-        cfg["auto_listen_resume_delay_ms"] = 1500
-    try:
-        cfg["auto_listen_min_segment_ms"] = max(100, int(cfg.get("auto_listen_min_segment_ms", 1400)))
-    except Exception:
-        cfg["auto_listen_min_segment_ms"] = 1400
-    try:
-        cfg["auto_listen_min_voiced_ratio"] = min(1.0, max(0.0, float(cfg.get("auto_listen_min_voiced_ratio", 0.60))))
-    except Exception:
-        cfg["auto_listen_min_voiced_ratio"] = 0.60
-    cfg["tts_streaming_enabled"] = bool(cfg.get("tts_streaming_enabled", False))
-    try:
-        cfg["tts_stream_min_words"] = int(cfg.get("tts_stream_min_words", 12))
-    except Exception:
-        cfg["tts_stream_min_words"] = 12
-    cfg["tts_stream_min_words"] = max(1, cfg["tts_stream_min_words"])
-    cfg["tts_stream_cut_on_punctuation"] = bool(cfg.get("tts_stream_cut_on_punctuation", False))
-    whisper_language = str(cfg.get("whisper_language", "es")).strip().lower()
-    if not whisper_language:
-        whisper_language = "es"
-    cfg["whisper_language"] = whisper_language
-    whisper_ov_device = str(cfg.get("whisper_openvino_device", "AUTO")).strip().upper()
-    if whisper_ov_device not in WHISPER_OV_DEVICE_OPTIONS:
-        whisper_ov_device = "AUTO"
-    cfg["whisper_openvino_device"] = whisper_ov_device
-    cfg["whisper_openvino_model_id"] = str(cfg.get("whisper_openvino_model_id", "")).strip()
-    tts_backend = normalize_tts_backend_for_platform(
-        cfg.get("tts_backend", DEFAULT_TTS_BACKEND),
-        PLATFORM_NAME,
+    env = RobotConfigEnv(
+        robot_config_file=ROBOT_CONFIG_FILE,
+        platform_name=PLATFORM_NAME,
+        default_device=DEFAULT_DEVICE,
+        default_performance_hint=DEFAULT_PERFORMANCE_HINT,
+        default_whisper_model=DEFAULT_WHISPER_MODEL,
+        default_tts_backend=DEFAULT_TTS_BACKEND,
+        whisper_ov_device_options=WHISPER_OV_DEVICE_OPTIONS,
+        whisper_language_options=WHISPER_LANGUAGE_OPTIONS,
+        openvino_tts_device_options=PARLER_OV_DEVICE_OPTIONS,
+        kokoro_device_options=KOKORO_DEVICE_OPTIONS,
+        babelvox_device_options=BABELVOX_DEVICE_OPTIONS,
+        babelvox_precision_options=BABELVOX_PRECISION_OPTIONS,
     )
-    cfg["tts_backend"] = tts_backend
-    openvino_tts_device = str(cfg.get("openvino_tts_device", "AUTO")).strip().upper()
-    if openvino_tts_device not in PARLER_OV_DEVICE_OPTIONS:
-        openvino_tts_device = "AUTO"
-    cfg["openvino_tts_device"] = openvino_tts_device
-    cfg["openvino_tts_model_id"] = str(cfg.get("openvino_tts_model_id", "")).strip()
-    try:
-        cfg["openvino_tts_timeout_s"] = max(3, int(cfg.get("openvino_tts_timeout_s", 25)))
-    except Exception:
-        cfg["openvino_tts_timeout_s"] = 25
-    cfg["openvino_tts_isolated_gpu"] = bool(cfg.get("openvino_tts_isolated_gpu", True))
-    try:
-        cfg["openvino_tts_speed"] = float(cfg.get("openvino_tts_speed", 1.0))
-    except Exception:
-        cfg["openvino_tts_speed"] = 1.0
-    cfg["openvino_tts_speed"] = min(2.0, max(0.5, cfg["openvino_tts_speed"]))
-    try:
-        cfg["openvino_tts_gain"] = float(cfg.get("openvino_tts_gain", 1.0))
-    except Exception:
-        cfg["openvino_tts_gain"] = 1.0
-    cfg["openvino_tts_gain"] = min(3.0, max(0.1, cfg["openvino_tts_gain"]))
-    cfg["kokoro_model_id"] = str(cfg.get("kokoro_model_id", "kokoro-tts-intel")).strip()
-    kokoro_device = str(cfg.get("kokoro_device", "GPU")).strip().upper()
-    if kokoro_device not in KOKORO_DEVICE_OPTIONS:
-        kokoro_device = "GPU"
-    cfg["kokoro_device"] = kokoro_device
-    cfg["kokoro_voice"] = str(cfg.get("kokoro_voice", "af_sarah")).strip() or "af_sarah"
-    cfg["babelvox_model_id"] = str(cfg.get("babelvox_model_id", "babelvox-openvino-int8")).strip()
-    babelvox_device = str(cfg.get("babelvox_device", "CPU")).strip().upper()
-    if babelvox_device not in BABELVOX_DEVICE_OPTIONS:
-        babelvox_device = "CPU"
-    cfg["babelvox_device"] = babelvox_device
-    babelvox_precision = str(cfg.get("babelvox_precision", "int8")).strip().lower()
-    if babelvox_precision not in BABELVOX_PRECISION_OPTIONS:
-        babelvox_precision = "int8"
-    cfg["babelvox_precision"] = babelvox_precision
-    babelvox_language = str(cfg.get("babelvox_language", "es")).strip().lower()
-    if babelvox_language not in WHISPER_LANGUAGE_OPTIONS:
-        babelvox_language = "es"
-    cfg["babelvox_language"] = babelvox_language
-    cfg["tada_model_id"] = str(cfg.get("tada_model_id", "HumeAI/tada-1b")).strip() or "HumeAI/tada-1b"
-    cfg["tada_codec_id"] = str(cfg.get("tada_codec_id", "HumeAI/tada-codec")).strip() or "HumeAI/tada-codec"
-    cfg["tada_device"] = str(cfg.get("tada_device", "cpu")).strip() or "cpu"
-    tada_language = str(cfg.get("tada_language", "en")).strip().lower()
-    cfg["tada_language"] = tada_language or "en"
-    cfg["tada_reference_audio_path"] = str(cfg.get("tada_reference_audio_path", "")).strip()
-    cfg["tada_reference_text"] = str(cfg.get("tada_reference_text", "")).strip()
-    try:
-        cfg["tada_sample_rate"] = max(8000, int(cfg.get("tada_sample_rate", 24000)))
-    except Exception:
-        cfg["tada_sample_rate"] = 24000
-    cfg["espeak_voice"] = str(cfg.get("espeak_voice", "es")).strip() or "es"
-    try:
-        cfg["espeak_rate"] = int(cfg.get("espeak_rate", 145))
-    except Exception:
-        cfg["espeak_rate"] = 145
-    cfg["espeak_rate"] = min(450, max(80, cfg["espeak_rate"]))
-    try:
-        cfg["espeak_pitch"] = int(cfg.get("espeak_pitch", 45))
-    except Exception:
-        cfg["espeak_pitch"] = 45
-    cfg["espeak_pitch"] = min(99, max(0, cfg["espeak_pitch"]))
-    try:
-        cfg["espeak_amplitude"] = int(cfg.get("espeak_amplitude", 120))
-    except Exception:
-        cfg["espeak_amplitude"] = 120
-    cfg["espeak_amplitude"] = min(200, max(0, cfg["espeak_amplitude"]))
+    cfg, warning = load_robot_config_impl(env, normalize_tts_backend_for_platform)
+    if warning:
+        print(f"\n⚠️ {warning}\n")
     return cfg
 
 
 def save_robot_config(config: dict) -> None:
-    try:
-        ROBOT_CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"✅ Config saved to {ROBOT_CONFIG_FILE}\n")
-    except Exception as exc:
-        print(f"\n⚠️ Could not save config: {exc}\n")
+    ok, message = save_robot_config_impl(config, ROBOT_CONFIG_FILE)
+    if ok:
+        print(f"✅ {message}\n")
+    else:
+        print(f"\n⚠️ {message}\n")
 
 
 def apply_runtime_from_config(config: dict) -> None:
@@ -5279,188 +5008,69 @@ def resolve_ov_whisper_language(model_dir: Path, requested_lang: str) -> tuple[s
 
 
 def ensure_stt_runtime(stt_runtime: dict, config: dict) -> bool:
-    compat = stt_runtime.get("compat")
-    def reset_loaded_models() -> None:
-        stt_runtime["model"] = None
-        stt_runtime["model_name"] = None
-        stt_runtime["ov_pipeline"] = None
-        stt_runtime["ov_model_id"] = None
-        stt_runtime["ov_model_dir"] = None
-        stt_runtime["backend"] = None
-
-    if stt_runtime.get("numpy") is None:
-        stt_runtime["numpy"] = ensure_dependency("numpy", "numpy", "NumPy")
-        if stt_runtime["numpy"] is None:
-            return False
-    if stt_runtime.get("sounddevice") is None:
-        stt_runtime["sounddevice"] = ensure_dependency("sounddevice", "sounddevice", "SoundDevice")
-        if stt_runtime["sounddevice"] is None:
-            return False
-
-    use_ov = bool(config.get("whisper_openvino", False))
-    if use_ov:
-        requested_device = str(config.get("whisper_openvino_device", "AUTO")).strip().upper()
-        selected_id_for_key = str(config.get("whisper_openvino_model_id", "")).strip() or "unknown"
-        compat_key = f"stt:whisper_ov:{selected_id_for_key}"
-        if ov_genai is None:
-            print_error_red(
-                "ERROR: whisper_openvino is enabled but openvino_genai is not installed "
-                "in this environment."
-            )
-            mark_runtime_chip_compat(compat, compat_key, requested_device, False)
-            return False
-        ov_models = load_whisper_ov_models()
-        if not ov_models:
-            print_error_red("ERROR: Whisper OpenVINO is enabled but no OV models are configured.")
-            mark_runtime_chip_compat(compat, compat_key, requested_device, False)
-            return False
-
-        selected_id = str(config.get("whisper_openvino_model_id", "")).strip()
-        selected = next((m for m in ov_models if m["id"] == selected_id), None)
-        if selected is None:
-            selected = ov_models[0]
-            config["whisper_openvino_model_id"] = selected["id"]
-            save_robot_config(config)
-        compat_key = f"stt:whisper_ov:{selected['id']}"
-
-        ov_device = str(config.get("whisper_openvino_device", "AUTO")).strip().upper()
-        if ov_device not in WHISPER_OV_DEVICE_OPTIONS:
-            ov_device = "AUTO"
-            config["whisper_openvino_device"] = ov_device
-            save_robot_config(config)
-
-        key = ("ov", selected["id"], ov_device)
-        if stt_runtime.get("active_key") != key or stt_runtime.get("ov_pipeline") is None:
-            if stt_runtime.get("active_key") is not None:
-                print("Releasing previous STT model...")
-                reset_loaded_models()
-                stt_runtime["active_key"] = None
-                gc.collect()
-            try:
-                if not is_downloaded(selected["local"]):
-                    download_whisper_ov_model(selected)
-                print(f"Loading Whisper OpenVINO model '{selected['display']}' on {ov_device}...")
-                stt_runtime["ov_pipeline"] = ov_genai.WhisperPipeline(str(selected["local"]), ov_device)
-                stt_runtime["ov_model_id"] = selected["id"]
-                stt_runtime["ov_model_dir"] = str(selected["local"])
-                stt_runtime["whisper"] = None
-                stt_runtime["backend"] = "ov"
-                stt_runtime["active_key"] = key
-                mark_runtime_chip_compat(compat, compat_key, ov_device, True)
-                print(f"✅ Whisper OV model active: {selected['id']} ({ov_device})\n")
-            except Exception as exc:
-                print_error_red(f"ERROR: Failed to initialize Whisper OpenVINO: {exc}")
-                mark_runtime_chip_compat(compat, compat_key, ov_device, False)
-                reset_loaded_models()
-                stt_runtime["active_key"] = None
-                return False
-        else:
-            stt_runtime["backend"] = "ov"
-        return True
-
-    if stt_runtime.get("whisper") is None:
-        stt_runtime["whisper"] = ensure_dependency("whisper", "openai-whisper", "Whisper")
-        if stt_runtime["whisper"] is None:
-            return False
-
-    model_name = str(config.get("whisper_model", DEFAULT_WHISPER_MODEL))
-    compat_key = f"stt:whisper:{model_name}"
-    if model_name not in WHISPER_MODELS:
-        model_name = DEFAULT_WHISPER_MODEL
-        config["whisper_model"] = model_name
-        save_robot_config(config)
-        compat_key = f"stt:whisper:{model_name}"
-
-    key = ("whisper", model_name)
-    if stt_runtime.get("active_key") != key or stt_runtime.get("model") is None:
-        if stt_runtime.get("active_key") is not None:
-            print("Releasing previous STT model...")
-            reset_loaded_models()
-            stt_runtime["active_key"] = None
-            gc.collect()
-
-        local_model = whisper_local_model_path(stt_runtime["whisper"], model_name)
-        if local_model and os.path.exists(local_model):
-            print(f"Whisper model '{model_name}' already downloaded.")
-        else:
-            print(f"Whisper model '{model_name}' is not downloaded. Downloading...")
-        print(f"Loading Whisper model '{model_name}'...")
-        try:
-            stt_runtime["model"] = stt_runtime["whisper"].load_model(model_name)
-            stt_runtime["model_name"] = model_name
-            stt_runtime["backend"] = "whisper"
-            stt_runtime["active_key"] = key
-            mark_runtime_chip_compat(compat, compat_key, "CPU", True)
-            print(f"✅ Whisper model active: {model_name}\n")
-        except Exception as exc:
-            print(f"\n⚠️ Failed to load Whisper model '{model_name}': {exc}\n")
-            mark_runtime_chip_compat(compat, compat_key, "CPU", False)
-            reset_loaded_models()
-            stt_runtime["active_key"] = None
-            return False
-    return True
+    deps = STTRuntimeDeps(
+        ensure_dependency=ensure_dependency,
+        ov_genai=ov_genai,
+        load_whisper_ov_models=load_whisper_ov_models,
+        mark_runtime_chip_compat=mark_runtime_chip_compat,
+        is_downloaded=is_downloaded,
+        download_whisper_ov_model=download_whisper_ov_model,
+        save_robot_config=save_robot_config,
+        whisper_ov_device_options=tuple(WHISPER_OV_DEVICE_OPTIONS),
+        print_error_red=print_error_red,
+        default_whisper_model=DEFAULT_WHISPER_MODEL,
+        whisper_models=tuple(WHISPER_MODELS),
+        whisper_local_model_path=whisper_local_model_path,
+        resolve_ov_whisper_language=resolve_ov_whisper_language,
+        resolve_audio_input_device=resolve_audio_input_device,
+        record_until_space=record_until_space,
+        whisper_language_options=tuple(WHISPER_LANGUAGE_OPTIONS),
+    )
+    return ensure_stt_runtime_impl(stt_runtime, config, deps)
 
 
 def transcribe_from_mic(stt_runtime: dict, config: dict) -> tuple[str, float]:
-    if not ensure_stt_runtime(stt_runtime, config):
-        return "", 0.0
-    np_mod = stt_runtime["numpy"]
-    device = resolve_audio_input_device(config, stt_runtime["sounddevice"])
-    audio, speech_end_ts = record_until_space(stt_runtime["sounddevice"], np_mod, device=device)
-    if getattr(audio, "size", 0) == 0:
-        print("\n⚠️ No audio captured.\n")
-        return "", 0.0
-    return transcribe_audio_buffer(stt_runtime, config, audio, speech_end_ts)
+    deps = STTRuntimeDeps(
+        ensure_dependency=ensure_dependency,
+        ov_genai=ov_genai,
+        load_whisper_ov_models=load_whisper_ov_models,
+        mark_runtime_chip_compat=mark_runtime_chip_compat,
+        is_downloaded=is_downloaded,
+        download_whisper_ov_model=download_whisper_ov_model,
+        save_robot_config=save_robot_config,
+        whisper_ov_device_options=tuple(WHISPER_OV_DEVICE_OPTIONS),
+        print_error_red=print_error_red,
+        default_whisper_model=DEFAULT_WHISPER_MODEL,
+        whisper_models=tuple(WHISPER_MODELS),
+        whisper_local_model_path=whisper_local_model_path,
+        resolve_ov_whisper_language=resolve_ov_whisper_language,
+        resolve_audio_input_device=resolve_audio_input_device,
+        record_until_space=record_until_space,
+        whisper_language_options=tuple(WHISPER_LANGUAGE_OPTIONS),
+    )
+    return transcribe_from_mic_impl(stt_runtime, config, deps, transcribe_audio_buffer)
 
 
 def transcribe_audio_buffer(stt_runtime: dict, config: dict, audio, speech_end_ts: float | None = None) -> tuple[str, float]:
-    if not ensure_stt_runtime(stt_runtime, config):
-        return "", 0.0
-    if getattr(audio, "size", 0) == 0:
-        return "", 0.0
-    speech_end_ts = speech_end_ts if speech_end_ts is not None else time.perf_counter()
-    is_ov = stt_runtime.get("backend") == "ov"
-    whisper_language = str(config.get("whisper_language", "es")).strip().lower()
-    if whisper_language not in WHISPER_LANGUAGE_OPTIONS:
-        whisper_language = "es"
-    print("📝 Transcribing with Whisper OpenVINO..." if is_ov else "📝 Transcribing...")
-    try:
-        if is_ov:
-            ov_kwargs = {"task": "transcribe"}
-            if whisper_language != "auto":
-                model_dir = Path(str(stt_runtime.get("ov_model_dir", "")).strip()) if stt_runtime.get("ov_model_dir") else None
-                resolved_lang = whisper_language
-                warning = None
-                if model_dir is not None and model_dir.exists():
-                    resolved_lang, warning = resolve_ov_whisper_language(model_dir, whisper_language)
-                if warning:
-                    print_error_red(f"ERROR: {warning}")
-                if resolved_lang:
-                    ov_kwargs["language"] = resolved_lang
-            result = stt_runtime["ov_pipeline"].generate(audio.tolist(), **ov_kwargs)
-            text = ""
-            if hasattr(result, "text"):
-                text = str(getattr(result, "text", "")).strip()
-            elif hasattr(result, "texts"):
-                texts = getattr(result, "texts", [])
-                text = str(texts[0]).strip() if texts else ""
-            if not text:
-                text = str(result).strip()
-        else:
-            whisper_kwargs = {"fp16": False, "task": "transcribe"}
-            if whisper_language != "auto":
-                whisper_kwargs["language"] = whisper_language
-            result = stt_runtime["model"].transcribe(audio, **whisper_kwargs)
-            text = str(result.get("text", "")).strip()
-    except Exception as exc:
-        print_error_red(f"ERROR: STT transcription failed: {exc}")
-        return "", time.perf_counter() - speech_end_ts
-    speech_end_to_text_s = time.perf_counter() - speech_end_ts
-    if not text:
-        print("\n⚠️ No speech detected.\n")
-        return "", speech_end_to_text_s
-    print(f"You said: {text}\n")
-    return text, speech_end_to_text_s
+    deps = STTRuntimeDeps(
+        ensure_dependency=ensure_dependency,
+        ov_genai=ov_genai,
+        load_whisper_ov_models=load_whisper_ov_models,
+        mark_runtime_chip_compat=mark_runtime_chip_compat,
+        is_downloaded=is_downloaded,
+        download_whisper_ov_model=download_whisper_ov_model,
+        save_robot_config=save_robot_config,
+        whisper_ov_device_options=tuple(WHISPER_OV_DEVICE_OPTIONS),
+        print_error_red=print_error_red,
+        default_whisper_model=DEFAULT_WHISPER_MODEL,
+        whisper_models=tuple(WHISPER_MODELS),
+        whisper_local_model_path=whisper_local_model_path,
+        resolve_ov_whisper_language=resolve_ov_whisper_language,
+        resolve_audio_input_device=resolve_audio_input_device,
+        record_until_space=record_until_space,
+        whisper_language_options=tuple(WHISPER_LANGUAGE_OPTIONS),
+    )
+    return transcribe_audio_buffer_impl(stt_runtime, config, audio, deps, speech_end_ts)
 
 
 def save_float_audio_to_wav(path: Path, audio, sample_rate: int, np_mod) -> None:
@@ -5539,39 +5149,19 @@ def process_auto_listen_text(
 
 
 def is_valid_auto_listen_transcript(text: str) -> bool:
-    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
-    words = [w for w in re.split(r"\s+", normalized) if w]
-    if not words:
-        return False
-    if len(words) >= 4:
-        return True
-    return "hola" in words
+    return is_valid_auto_listen_transcript_impl(text)
 
 
 def spoken_phrase_to_words(text: str) -> list[str]:
-    raw_words = re.split(r"[\s,.;:!?¡¿()\[\]{}\"“”'`´\-_/\\]+", str(text or "").strip().lower())
-    words: list[str] = []
-    for raw in raw_words:
-        cleaned = "".join(ch for ch in raw if ch.isalnum())
-        if not cleaned:
-            continue
-        normalized = unicodedata.normalize("NFKD", cleaned)
-        without_accents = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-        if without_accents:
-            words.append(without_accents)
-    return words
+    return spoken_phrase_to_words_impl(text)
 
 
 def transcript_matches_phrase(text: str, phrase: str) -> bool:
-    text_words = spoken_phrase_to_words(text)
-    phrase_words = spoken_phrase_to_words(phrase)
-    if not text_words or not phrase_words:
-        return False
-    return text_words == phrase_words
+    return transcript_matches_phrase_impl(text, phrase)
 
 
 def should_run_auto_listen_worker(config: dict) -> bool:
-    return bool(config.get("auto_listen_enabled", False) or config.get("wake_word_enabled", False))
+    return should_run_auto_listen_worker_impl(config)
 
 
 def speak_wake_word_response(
@@ -5603,31 +5193,20 @@ def handle_wake_word_transcript(
     config: dict,
     tts_runtime: dict,
 ) -> bool:
-    if not bool(config.get("wake_word_enabled", False)):
+    consumed, response = apply_wake_word_transcript(text, config)
+    if not consumed:
         return False
-    wake_phrase = str(config.get("wake_word_phrase", "hola robot")).strip()
-    stop_phrase = str(config.get("wake_word_stop_phrase", "adios robot")).strip()
-    auto_active = bool(config.get("auto_listen_enabled", False))
-    if not auto_active:
-        if transcript_matches_phrase(text, wake_phrase):
-            config["auto_listen_enabled"] = True
-            save_robot_config(config)
+    save_robot_config(config)
+    if bool(config.get("auto_listen_enabled", False)):
+        if response:
             print(f"[wake-word] activated by: {text}\n")
-            speak_wake_word_response(str(config.get("wake_word_on_response", "Te escucho.")).strip(), speaker, config, tts_runtime)
-            return True
+            speak_wake_word_response(response, speaker, config, tts_runtime)
         return True
-    if transcript_matches_phrase(text, stop_phrase):
-        config["auto_listen_enabled"] = False
-        save_robot_config(config)
+    if response:
         print(f"[wake-word] deactivated by: {text}\n")
-        speak_wake_word_response(
-            str(config.get("wake_word_off_response", "Modo escucha desactivado.")).strip(),
-            speaker,
-            config,
-            tts_runtime,
-        )
+        speak_wake_word_response(response, speaker, config, tts_runtime)
         return True
-    return False
+    return True
 
 
 def _reset_vad_segment_state(state: dict) -> None:
@@ -7037,19 +6616,8 @@ def run_chat_turn(
         print("⚠️ No model loaded. Use '/models' to load one (or '/help').\n")
         return False
 
-    history.append(f"User: {user_text}")
-    system_prompt = str(voice_config.get("system_prompt", "")).strip()
-    max_new_tokens = int(voice_config.get("max_new_tokens", 300))
-    # Approximation for Spanish: 1 token ~= 0.65 words
-    max_words_estimate = max(1, int(max_new_tokens * 0.65))
-    system_limit_note = (
-        f"Anexo: No respondas con mas de {max_words_estimate} palabras."
-    )
-    if system_prompt:
-        effective_system_prompt = f"{system_prompt}\n{system_limit_note}"
-        prompt = f"System: {effective_system_prompt}\n" + "\n".join(history) + "\nAssistant:"
-    else:
-        prompt = f"System: {system_limit_note}\n" + "\n".join(history) + "\nAssistant:"
+    append_user_message(history, user_text)
+    prompt, max_new_tokens = build_chat_prompt(history, voice_config)
 
     t_start = time.perf_counter()
     first_token_time = None
@@ -7237,7 +6805,7 @@ def run_chat_turn(
             if show_roundtrip_lines:
                 print("⏱️ text -> audio: skipped (audio off)")
 
-        history.append(f"Assistant: {answer}")
+        append_assistant_message(history, answer)
         return True
     finally:
         if response_audio_activity_started:
@@ -7419,100 +6987,24 @@ def main() -> None:
     current = None
     history = []
     server = None
-    server_state = {"pipe": None, "current": None, "config": None}
+    server_state = build_server_state(None)
     voice_config = load_robot_config()
     apply_runtime_from_config(voice_config)
     server_state["config"] = voice_config
-    stt_runtime = {
-        "numpy": None,
-        "sounddevice": None,
-        "whisper": None,
-        "model": None,
-        "model_name": None,
-        "ov_pipeline": None,
-        "ov_model_id": None,
-        "backend": None,
-        "active_key": None,
-        "compat": compat,
-    }
-    tts_runtime = {
-        "pipeline": None,
-        "model_id": None,
-        "backend": None,
-        "active_key": None,
-        "ov_model_dir": None,
-        "ov_device": None,
-        "numpy": None,
-        "sounddevice": None,
-        "kokoro_engine": None,
-        "babelvox_engine": None,
-        "tada_model": None,
-        "tada_encoder": None,
-        "torch": None,
-        "torchaudio": None,
-        "compat": compat,
-    }
+    stt_runtime = build_stt_runtime(compat)
+    tts_runtime = build_tts_runtime(compat)
     speaker = None
     voices = None
-    camera_runtime = {
-        "cv2": None,
-        "thread": None,
-        "vision_event_thread": None,
-        "vision_event_queue": None,
-        "stop_event": None,
-        "panel_enabled": False,
-        "panel_backend": None,
-        "active_device_index": None,
-        "qt_panel_process": None,
-        "qt_panel_state_queue": None,
-        "qt_panel_action_queue": None,
-        "qt_panel_stop_event": None,
-        "speaker": speaker,
-        "voice_config": voice_config,
-        "tts_runtime": tts_runtime,
-        "vision_log_enabled": bool(voice_config.get("vision_log_enabled", False)),
-        "vision_log_interval_s": float(voice_config.get("vision_log_interval_s", 1.0)),
-        "vision_log_last_ts": 0.0,
-        "vision_event_processing_enabled": bool(voice_config.get("vision_event_processing_enabled", True)),
-        "vision_event_last_ts": 0.0,
-        "vision_last_detection_count": 0,
-        "suppress_next_join_after_interrupt": False,
-        "robot_face_gesture": "",
-        "robot_face_gesture_until": 0.0,
-    }
-    llm_state = {
-        "pipe": pipe,
-        "current": current,
-        "history": history,
-        "server_state": server_state,
-        "compat": compat,
-    }
-    auto_listen_runtime = {
-        "thread": None,
-        "stop_event": None,
-        "audio_monitor_thread": None,
-        "audio_monitor_stop_event": None,
-        "voice_config": voice_config,
-        "stt_runtime": stt_runtime,
-        "tts_runtime": tts_runtime,
-        "speaker": speaker,
-        "llm_state": llm_state,
-        "stats": stats,
-        "silero_vad": None,
-        "silero_model": None,
-        "silero_vad_iterator_cls": None,
-        "cv2": None,
-        "last_is_speech": False,
-        "last_speech_probability": 0.0,
-        "last_speech_probability_threshold": 0.50,
-        "last_speech_started": False,
-        "last_speech_frames": 0,
-        "last_start_event": 0.0,
-        "last_end_event": 0.0,
-        "last_display_segment_frames": 1,
-        "last_recording": False,
-        "vad_log_last_ts": 0.0,
-    }
+    camera_runtime = build_camera_runtime(voice_config, tts_runtime, speaker=speaker)
+    llm_state = build_llm_state(pipe, current, history, server_state, compat)
+    auto_listen_runtime = build_auto_listen_runtime(
+        voice_config,
+        stt_runtime,
+        tts_runtime,
+        speaker,
+        llm_state,
+        stats,
+    )
     camera_runtime["auto_listen_runtime"] = auto_listen_runtime
     auto_listen_runtime["camera_runtime"] = camera_runtime
 

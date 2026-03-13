@@ -6,6 +6,8 @@ def test_os_specific_requirements_files_exist():
     assert Path("requirements-linux.txt").exists()
     assert Path("requirements-tada.txt").exists()
     assert Path("vision_models.json").exists()
+    assert Path("coverage.sh").exists()
+    assert Path("coverage.ps1").exists()
 
 
 def test_windows_requirements_include_pywin32():
@@ -36,6 +38,15 @@ def test_requirements_do_not_include_parler_tts():
 def test_requirements_include_setuptools():
     assert "setuptools<82" in Path("requirements-windows.txt").read_text(encoding="utf-8")
     assert "setuptools<82" in Path("requirements-linux.txt").read_text(encoding="utf-8")
+
+
+def test_requirements_include_coverage_stack():
+    windows = Path("requirements-windows.txt").read_text(encoding="utf-8")
+    linux = Path("requirements-linux.txt").read_text(encoding="utf-8")
+    assert "coverage" in windows
+    assert "coverage" in linux
+    assert "pytest-cov" in windows
+    assert "pytest-cov" in linux
 
 
 def test_optional_tada_requirements_file_contains_tada_stack():

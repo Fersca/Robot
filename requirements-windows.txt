@@ -5,6 +5,8 @@ openvino
 openvino_genai
 pywin32
 pytest
+pytest-cov
+coverage
 setuptools<82
 sounddevice
 torch

@@ -4,6 +4,8 @@ openai-whisper
 openvino
 openvino_genai
 pytest
+pytest-cov
+coverage
 setuptools<82
 sounddevice
 torch
