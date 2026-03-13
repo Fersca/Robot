@@ -3172,6 +3172,9 @@ Commands:
   /log <on|off|seconds>     Print throttled raw vision output to the console for debugging
   /vision_events <on|off>   Enable or disable throttled vision event processing and TTS reactions
   /auto_listen <on|off>     Enable or disable continuous microphone VAD + automatic STT
+  /vad_preroll <ms>         Set pre-roll audio padding before detected speech
+  /vad_silence <ms>         Set silence time before auto-listen closes a phrase
+  /vad_max_segment <sec>    Set the maximum duration of a captured auto-listen phrase
   /vision_models            List configured vision models
   /vision_select            Select and download a vision model
   /vision_model             Set the OpenVINO detection model XML path
@@ -7484,6 +7487,81 @@ def main() -> None:
                     print("\n✅ auto_listen = off\n")
                     continue
                 print("\n⚠️ Use /auto_listen on|off\n")
+                continue
+
+            if cmd.startswith("vad_silence"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    current_ms = int(voice_config.get("auto_listen_silence_ms", 1600))
+                    print(f"\nvad_silence is currently: {current_ms} ms")
+                    print("Usage: /vad_silence <milliseconds>\n")
+                    continue
+                try:
+                    value_ms = int(parts[1].strip())
+                except ValueError:
+                    print("\n⚠️ /vad_silence expects an integer number of milliseconds.\n")
+                    continue
+                if value_ms < 100:
+                    print("\n⚠️ /vad_silence must be at least 100 ms.\n")
+                    continue
+                voice_config["auto_listen_silence_ms"] = value_ms
+                save_robot_config(voice_config)
+                if bool(voice_config.get("auto_listen_enabled", False)):
+                    stop_auto_listen(auto_listen_runtime)
+                    start_auto_listen(auto_listen_runtime, voice_config)
+                    print(f"\n✅ vad_silence = {value_ms} ms | auto_listen restarted\n")
+                else:
+                    print(f"\n✅ vad_silence = {value_ms} ms\n")
+                continue
+
+            if cmd.startswith("vad_preroll"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    current_ms = int(voice_config.get("auto_listen_preroll_ms", 350))
+                    print(f"\nvad_preroll is currently: {current_ms} ms")
+                    print("Usage: /vad_preroll <milliseconds>\n")
+                    continue
+                try:
+                    value_ms = int(parts[1].strip())
+                except ValueError:
+                    print("\n⚠️ /vad_preroll expects an integer number of milliseconds.\n")
+                    continue
+                if value_ms < 0:
+                    print("\n⚠️ /vad_preroll must be 0 ms or higher.\n")
+                    continue
+                voice_config["auto_listen_preroll_ms"] = value_ms
+                save_robot_config(voice_config)
+                if bool(voice_config.get("auto_listen_enabled", False)):
+                    stop_auto_listen(auto_listen_runtime)
+                    start_auto_listen(auto_listen_runtime, voice_config)
+                    print(f"\n✅ vad_preroll = {value_ms} ms | auto_listen restarted\n")
+                else:
+                    print(f"\n✅ vad_preroll = {value_ms} ms\n")
+                continue
+
+            if cmd.startswith("vad_max_segment"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) != 2:
+                    current_s = float(voice_config.get("auto_listen_max_segment_s", 60.0))
+                    print(f"\nvad_max_segment is currently: {current_s:.1f} s")
+                    print("Usage: /vad_max_segment <seconds>\n")
+                    continue
+                try:
+                    value_s = float(parts[1].strip())
+                except ValueError:
+                    print("\n⚠️ /vad_max_segment expects a number of seconds.\n")
+                    continue
+                if value_s < 1.0:
+                    print("\n⚠️ /vad_max_segment must be at least 1 second.\n")
+                    continue
+                voice_config["auto_listen_max_segment_s"] = value_s
+                save_robot_config(voice_config)
+                if bool(voice_config.get("auto_listen_enabled", False)):
+                    stop_auto_listen(auto_listen_runtime)
+                    start_auto_listen(auto_listen_runtime, voice_config)
+                    print(f"\n✅ vad_max_segment = {value_s:.1f} s | auto_listen restarted\n")
+                else:
+                    print(f"\n✅ vad_max_segment = {value_s:.1f} s\n")
                 continue
 
             if cmd == "whisper_models":
